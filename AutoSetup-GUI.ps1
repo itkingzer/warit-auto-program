@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $StatePath = Join-Path $Root state.json
 function Test-UpdateOwnsStartup {
+    if (Test-Path -LiteralPath (Join-Path $Root 'update-completed.flag') -PathType Leaf) { return $true }
     if (-not (Test-Path -LiteralPath $StatePath)) { return $false }
     $startupState = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($startupState.Mode -eq 'UpdateLoop') { return $true }
@@ -567,8 +568,8 @@ $choices = [ordered]@{
         <DockPanel>
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="20,0,0,0">
             <Button Name="CancelButton" Content="ยกเลิกงาน" Style="{StaticResource QuietButton}" Margin="0,0,8,0" IsEnabled="False"/>
-            <Button Name="StartButton" Style="{StaticResource PrimaryButton}" MinWidth="156" MinHeight="44" AutomationProperties.Name="เริ่มงานที่เลือก">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xE768;"/><TextBlock Text="เริ่มงานที่เลือก"/></StackPanel>
+            <Button Name="StartButton" Style="{StaticResource PrimaryButton}" MinWidth="156" MinHeight="44" AutomationProperties.Name="ดูคิวก่อนเริ่ม">
+              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xE768;"/><TextBlock Text="ดูคิวก่อนเริ่ม"/></StackPanel>
             </Button>
           </StackPanel>
           <StackPanel VerticalAlignment="Center">
@@ -1243,12 +1244,83 @@ function Show-PartitionDialog {
     if ($dialog.ShowDialog() -eq $true) { return [int]$slider.Value }
 }
 
+function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
+    . (Join-Path $Root 'modules\03-InstallAllAndFix.ps1')
+    $programs = @(Get-InstalledProgramRecords)
+    $plan = @(foreach ($key in $Selected) {
+        $choices[$key][0]
+        if ($key -eq 'Disk') { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
+        if ($key -in 'Apps','Runtimes','LINE','Office','Foxit','ACDSee') {
+            $entries = @($Config.Packages.$key | Where-Object { $_ })
+            if (-not $entries) { '  • ข้าม: ไม่มีรายการใน config.json' }
+            foreach ($entry in $entries) {
+                $status = try {
+                    if ($entry.Enabled -eq $false) { 'ข้าม: ปิดใน config.json' }
+                    elseif (Find-InstalledProgram $entry $programs) {
+                        if ($key -eq 'ACDSee') { 'ติดตั้งแล้ว มีขั้นตอนหลังติดตั้ง' }
+                        else { 'ข้าม: ติดตั้งแล้ว' }
+                    } else {
+                        $folder = Get-PayloadEntryFolder $key $entry
+                        switch (Get-PackagePayloadStatus $key $entry $folder) {
+                            'ขาดตัวติดตั้ง' { 'ข้าม: ขาดตัวติดตั้ง' }
+                            'พบไฟล์หลายตัว' { 'พบไฟล์หลายตัว งานอาจหยุดเมื่อถึงรายการนี้' }
+                            default { $_ }
+                        }
+                    }
+                } catch { $_.Exception.Message }
+                "  • $($entry.Name) — $status"
+            }
+        }
+        ''
+    })
+    if ($Hidden) {
+        $plan += 'ข้ามเพราะไม่พบโฟลเดอร์ Payload'
+        foreach ($key in $Hidden) { $plan += "  • $($choices[$key][0])" }
+    }
+    $restart = @(if ($Selected -contains 'Drivers') { 'หากไดรเวอร์ต้องรีสตาร์ท งานที่เหลือจะหยุดไว้' }
+        if ($Selected -contains 'Update') { 'หาก Windows Update ต้องรีสตาร์ท ให้กดปุ่มรีสตาร์ทในแอปเพื่อทำอัปเดตต่อ' })
+
+    [xml]$queueXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="ดูคิวก่อนเริ่ม" Width="640" Height="530" MinWidth="460" MinHeight="380"
+        ShowInTaskbar="False" WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="14"
+        Background="{DynamicResource CanvasBrush}" Foreground="{DynamicResource TextBrush}">
+  <DockPanel Margin="24">
+    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,14">
+      <TextBlock Text="ดูคิวก่อนเริ่ม" FontSize="24" FontWeight="SemiBold"/>
+      <TextBlock Name="QueueSummary" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
+    </StackPanel>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+      <Button Content="กลับไปแก้ไข" Style="{DynamicResource QuietButton}" IsCancel="True" Margin="0,0,8,0"/>
+      <Button Name="ConfirmQueue" Content="เริ่มงาน" Style="{DynamicResource PrimaryButton}"/>
+    </StackPanel>
+    <TextBlock Name="RestartNote" DockPanel.Dock="Bottom" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
+    <Border Style="{DynamicResource Card}" Margin="0,0,0,12">
+      <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <TextBlock Name="QueuePlan" TextWrapping="Wrap" Margin="0,0,8,0"/>
+      </ScrollViewer>
+    </Border>
+  </DockPanel>
+</Window>
+"@
+    $dialog = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($queueXaml))
+    $dialog.Icon = $Window.Icon
+    $dialog.Resources.MergedDictionaries.Add($Window.Resources)
+    $dialog.Owner = $Window
+    $dialog.FindName('QueueSummary').Text = "ลำดับงาน $($Selected.Count) งาน · สถานะไฟล์ ณ เวลาที่เปิดหน้านี้"
+    $dialog.FindName('QueuePlan').Text = ($plan -join [Environment]::NewLine).TrimEnd()
+    $dialog.FindName('RestartNote').Text = $restart -join [Environment]::NewLine
+    $dialog.FindName('ConfirmQueue').Add_Click({ $dialog.DialogResult = $true }.GetNewClosure())
+    return $dialog.ShowDialog() -eq $true
+}
+
 function Start-SelectedSetup([switch]$OfficeOnly, [switch]$StartupInstall) {
     if ($ui.Handle -or $ui.Reboot -or $ui.ResumeFinished) { return }
     Update-PayloadTaskVisibility
     $selected = @(if ($ui.Resume) { 'Update' }
         elseif ($StartupInstall) { 'Printer','Runtimes','Apps','LINE','Office','Update' }
         elseif ($OfficeOnly) { 'Office' } else { $choices.Keys | Where-Object { $checks[$_].IsChecked } })
+    $hidden = @($selected | Where-Object { $checks[$_].Visibility -ne 'Visible' })
     $selected = @($selected | Where-Object { $checks[$_].Visibility -eq 'Visible' })
     if (-not $selected) { $controls.Status.Text = 'เลือกอย่างน้อยหนึ่งรายการ'; return }
     $dataPercent = 0
@@ -1256,6 +1328,7 @@ function Start-SelectedSetup([switch]$OfficeOnly, [switch]$StartupInstall) {
         $dataPercent = Show-PartitionDialog
         if ($null -eq $dataPercent) { return }
     }
+    if (-not $StartupInstall -and -not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
     if ($StartupInstall) {
         $ui.BeforeAutorunSelection = @($choices.Keys | Where-Object { $checks[$_].IsChecked })
         foreach ($key in $choices.Keys) { $checks[$key].IsChecked = $key -in $selected }
@@ -1273,9 +1346,7 @@ function Start-SelectedSetup([switch]$OfficeOnly, [switch]$StartupInstall) {
 $controls.StartButton.Add_Click({ Start-SelectedSetup })
 $controls.InstallOffice.Add_Click({
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume -or -not $ui.OfficeLicense.CanInstall) { return }
-    if ([Windows.MessageBox]::Show($Window, 'ดาวน์โหลดและติดตั้ง Office Professional Plus 2024 Retail จาก Microsoft ตอนนี้หรือไม่?', 'ยืนยันการติดตั้ง Office', 'YesNo', 'Question') -eq 'Yes') {
-        Start-SelectedSetup -OfficeOnly
-    }
+    Start-SelectedSetup -OfficeOnly
 })
 $controls.CancelButton.Add_Click({
     $ui.Token.Cancel()

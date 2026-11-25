@@ -52,6 +52,7 @@ function Invoke-WindowsUpdateLoop([switch]$AutoRestart) {
         Assert-Running
         if ($search.Updates.Count -eq 0) {
             Clear-UpdateResume
+            [IO.File]::WriteAllText((Join-Path $Root 'update-completed.flag'), '')
             Write-Log 'ไม่มี Windows Update ที่เข้าเงื่อนไขเหลือแล้ว'
             return
         }

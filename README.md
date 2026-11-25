@@ -11,7 +11,7 @@
 1. ดาวน์โหลดโปรเจกต์จากปุ่ม **Code → Download ZIP** บน GitHub แล้วแตกไฟล์
 2. ถ้ามีตัวติดตั้ง ให้สร้างหรือวางโฟลเดอร์ `payloads\` ไว้ข้าง `Start-AutoSetup.vbs` แล้วจัดไฟล์ตาม [config.json](config.json)
 3. ดับเบิลคลิก `Start-AutoSetup.vbs` แล้วยืนยันสิทธิ์ผู้ดูแลระบบ หากเปิดไม่สำเร็จ ให้ใช้ `Start-AutoSetup.bat` เพื่อดูข้อความผิดพลาด
-4. กด **ตรวจ Payload** แล้วเลือกงานที่ต้องการก่อนกดเริ่ม
+4. กด **ตรวจ Payload** แล้วเลือกงานที่ต้องการ กด **ดูคิวก่อนเริ่ม** เพื่อตรวจลำดับงาน รายการที่ข้าม และเงื่อนไขรีสตาร์ท จากนั้นกด **เริ่มงาน**
 
 > GitHub มีซอร์สของแอปและไฟล์ตั้งค่า ส่วน `payloads/` เก็บแยกไว้ในเครื่อง เปิดแอปและใช้ Windows Update ได้ก่อนเตรียมตัวติดตั้ง
 
@@ -110,7 +110,7 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Build-AppZip.ps1
 - รัน `powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Install-Autorun.ps1` จากโฟลเดอร์โปรเจกต์เพื่อติดตั้งหรืออัปเดต autorun แบบซ่อนหน้าต่าง PowerShell สำหรับบัญชี Windows ปัจจุบัน หากย้ายโฟลเดอร์โปรเจกต์ ให้รันคำสั่งนี้อีกครั้งจากตำแหน่งใหม่
 - ถ้าต้องการติดตั้งอัตโนมัติเมื่อเข้า Windows ให้เติม `-AutoInstall` ต่อท้ายคำสั่งติดตั้ง Autorun โปรแกรมจะขอสิทธิ์ผู้ดูแลตามปกติ แล้วรัน Printer Error 709, Runtimes, Apps, LINE และ Office โดยไม่เรียก ACDSee หรือ Foxit หากไม่ต้องการรัน Printer ในโหมดนี้ ให้ตั้ง `Packages.Printer[0].Enabled` เป็น `false` ใน `config.json`
 - ถ้าไม่ใส่ `-AutoInstall` Autorun จะเปิดเฉพาะหน้าต่างโปรแกรมและไม่เริ่มติดตั้ง หากต้องการปิด Autorun ให้เปิด `shell:startup` แล้วลบ `Warit Auto Setup.lnk`
-- โหมด `-AutoInstall` ตรวจ Windows Update หลังทำรายการติดตั้งครบตามคิว ถ้า Windows แจ้งว่าต้องรีสตาร์ท แอปจะบันทึกสถานะและรีสตาร์ทอัตโนมัติ เมื่อเข้าบัญชีเดิมจะทำเฉพาะ Windows Update ต่อ
+- โหมด `-AutoInstall` ตรวจ Windows Update หลังทำรายการติดตั้งครบตามคิว ถ้า Windows แจ้งว่าต้องรีสตาร์ท แอปจะบันทึกสถานะและรีสตาร์ทอัตโนมัติ เมื่อเข้าบัญชีเดิมจะทำเฉพาะ Windows Update ต่อ เมื่อค้นหาสำเร็จและไม่มีอัปเดตเหลือ แอปจะหยุดเปิดเองตอนเข้าสู่ระบบ เปิดเองได้จาก `Start-AutoSetup.vbs` หรือรัน `Install-Autorun.ps1` อีกครั้งเพื่อเปิด Autorun รอบใหม่
 
 จัดทำโดย @warit ophang
 

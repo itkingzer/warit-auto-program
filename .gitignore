@@ -2,4 +2,5 @@
 /dist/
 /state.json
 /state.json.tmp
+/update-completed.flag
 /payloads/

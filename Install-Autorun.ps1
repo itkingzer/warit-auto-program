@@ -18,4 +18,5 @@ if ($AutoInstall) { $shortcut.Arguments += ' -AutoInstall' }
 $shortcut.WorkingDirectory = $PSScriptRoot
 $shortcut.IconLocation = '{0},0' -f (Join-Path $PSScriptRoot 'assets\app.ico')
 $shortcut.Save()
+[IO.File]::Delete((Join-Path $PSScriptRoot 'update-completed.flag'))
 Write-Output $path
