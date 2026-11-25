@@ -1,0 +1,237 @@
+{
+    "InstallerTimeoutSeconds":  1800,
+    "Personalization":  {
+                            "Wallpaper":  "",
+                            "ScreenSaverText":  "Warit Auto Setup"
+                        },
+    "Packages":  {
+                     "Printer":  [
+                                     {
+                                         "Name":  "Printer Error 709",
+                                         "Enabled":  true
+                                     }
+                                 ],
+                     "Runtimes":  [
+                                      {
+                                          "Name":  ".NET Framework 3.5",
+                                          "File":  "netfx35.cmd",
+                                          "Arguments":  "",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  ".NET Framework 4.8",
+                                          "File":  "ndp48-*.exe",
+                                          "Arguments":  "/q /norestart",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Visual C++ x86",
+                                          "DetectName":  "^Microsoft Visual C\\+\\+ (2015-20\\d{2}|v14).*Redistributable \\(x86\\)",
+                                          "File":  "vc_redist.x86.exe",
+                                          "Arguments":  "/install /quiet /norestart",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Visual C++ x64",
+                                          "DetectName":  "^Microsoft Visual C\\+\\+ (2015-20\\d{2}|v14).*Redistributable \\(x64\\)",
+                                          "File":  "vc_redist.x64.exe",
+                                          "Arguments":  "/install /quiet /norestart",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Visual C++ 2013 x64",
+                                          "DetectName":  "^Microsoft Visual C\\+\\+ 2013 Redistributable \\(x64\\)",
+                                          "File":  "vcredist_x64.exe",
+                                          "Arguments":  "/install /quiet /norestart",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "DirectX",
+                                          "File":  "DXSETUP.exe",
+                                          "Arguments":  "/silent",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Java",
+                                          "DetectName":  "^Java(?:\\(TM\\))? (?:8|[0-9]+ Update [0-9]+)(?:\\s|$)",
+                                          "File":  "jre-*.exe",
+                                          "Arguments":  "/s",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Adobe AIR",
+                                          "DetectName":  "^Adobe AIR(?:\\s|$)",
+                                          "File":  "AdobeAIR.exe",
+                                          "Arguments":  "-silent",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Microsoft Edge WebView2 Runtime x64",
+                                          "DetectName":  "^Microsoft Edge WebView2 Runtime(?:\\s|$)",
+                                          "File":  "MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
+                                          "Arguments":  "/silent /install",
+                                          "Enabled":  true
+                                      },
+                                      {
+                                          "Name":  "Adobe Flash Player",
+                                          "DetectName":  "^Adobe Flash Player(?:\\s|$)",
+                                          "File":  "flash-install.cmd",
+                                          "Arguments":  "",
+                                          "Enabled":  false
+                                      },
+                                      {
+                                          "Name":  "Adobe Shockwave",
+                                          "DetectName":  "^(Adobe )?Shockwave Player(?:\\s|$)",
+                                          "File":  "shockwave-install.cmd",
+                                          "Arguments":  "",
+                                          "Enabled":  false
+                                      }
+                                  ],
+                     "Apps":  [
+                                  {
+                                      "Name":  "Adobe Photoshop CS6 Extended",
+                                      "DetectName":  "^Adobe Photoshop CS6(?:\\s|$)",
+                                      "File":  "Adobe Photoshop CS6 Extended 13.1.2.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "7-Zip",
+                                      "DetectName":  "^7-Zip(?:\\s|$)",
+                                      "File":  "7z2606-x64.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "AIMP",
+                                      "DetectName":  "^AIMP(?:\\s|$)",
+                                      "File":  "aimp_5.40.2731_w64.exe",
+                                      "Arguments":  "/AUTO /SILENT",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Daum PotPlayer",
+                                      "DetectName":  "^(Daum\\s+)?PotPlayer(?:\\s|$)",
+                                      "File":  "PotPlayerSetup64.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Format Factory 5.22.0.0",
+                                      "DetectName":  "^Format\\s*Factory(?:\\s|$)",
+                                      "Subfolder":  "Format Factory 5.22.0.0",
+                                      "File":  "INSTALL.cmd",
+                                      "Arguments":  "",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Notepad++",
+                                      "DetectName":  "^Notepad\\+\\+(?:\\s|$)",
+                                      "File":  "npp.8.9.9.1.Installer.x64.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "PhotoScape",
+                                      "DetectName":  "^PhotoScape(?:\\s+v?[0-9].*)?$",
+                                      "File":  "PhotoScapeSetup_V3-7.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Revo Uninstaller Free",
+                                      "DetectName":  "^Revo Uninstaller(?!\\s*(?:Pro|Portable))(?:\\s|$)",
+                                      "File":  "revosetup.exe",
+                                      "Arguments":  "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "TeamViewer",
+                                      "DetectName":  "^TeamViewer(?:\\s+\\d.*)?$",
+                                      "File":  "TeamViewer_Setup*.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "WinRAR",
+                                      "DetectName":  "^WinRAR(?:\\s|$)",
+                                      "File":  "winrar-x64-723.exe",
+                                      "Arguments":  "/S",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Adobe AIR",
+                                      "DetectName":  "^Adobe AIR(?:\\s|$)",
+                                      "File":  "winstall-HARMAN_AdobeAIR.exe",
+                                      "Arguments":  "",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "AnyDesk",
+                                      "DetectName":  "^AnyDesk(?:\\s|$)",
+                                      "File":  "AnyDesk.exe",
+                                      "Arguments":  "--install \"C:\\Program Files (x86)\\AnyDesk\" --silent",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Zoom Workplace",
+                                      "DetectName":  "^Zoom(?:\\s+(?:Workplace|Meetings))?(?:\\s+\\(.*\\))?$",
+                                      "File":  "ZoomInstallerFull.exe",
+                                      "Arguments":  "/silent",
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "jdk-27_windows-x64_bin",
+                                      "File":  "jdk-27_windows-x64_bin.msi",
+                                      "Arguments":  "",
+                                      "Enabled":  true
+                                  }
+                              ],
+                     "Foxit":  [
+                                   {
+                                       "Name":  "FOXIT PDF Editor Pro",
+                                       "File":  "INSTALL (Run ADMIN).cmd",
+                                       "Arguments":  "",
+                                       "SuccessCodes":  [
+                                                            0,
+                                                            3
+                                                        ],
+                                       "Enabled":  true
+                                   }
+                               ],
+                     "ACDSee":  [
+                                    {
+                                        "Name":  "ACDSee Photo Studio Ultimate",
+                                        "DetectName":  "^ACDSee Photo Studio Ultimate(?:\\s|$)",
+                                        "File":  "acdsee-photo-studio-ultimate-2027-0-0-4660-win-en.exe",
+                                        "Arguments":  "",
+                                        "Enabled":  true
+                                    }
+                                ],
+                     "LINE":  [
+                                  {
+                                      "Name":  "LINE Desktop",
+                                      "DetectName":  "^LINE(?:\\s+Desktop|\\s+[0-9].*)?$",
+                                      "File":  "Install-Line.ps1",
+                                      "Arguments":  "",
+                                      "SuccessCodes":  [
+                                                           0
+                                                       ],
+                                      "Enabled":  true
+                                  }
+                              ],
+                     "Office":  [
+                                    {
+                                        "Name":  "Office Professional Plus 2024 Retail (64-bit)",
+                                        "DetectName":  "^Microsoft Office Professional Plus 2024 Retail$",
+                                        "File":  "office-install.cmd",
+                                        "Arguments":  "",
+                                        "SuccessCodes":  [
+                                                             0,
+                                                             3010
+                                                         ],
+                                        "Enabled":  true
+                                    }
+                                ]
+                 }
+}
