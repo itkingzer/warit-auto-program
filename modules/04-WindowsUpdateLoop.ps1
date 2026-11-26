@@ -102,7 +102,10 @@ function Invoke-WindowsUpdateLoop {
         $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
         if ($systemInfo.RebootRequired) { Save-UpdateRestart; return }
         Write-Log 'กำลังค้นหา Windows Update รวมอัปเดตเสริมและไดรเวอร์'
+        $phaseTimer = [Diagnostics.Stopwatch]::StartNew()
         $search = $searcher.Search('(IsInstalled=0 and IsHidden=0 and BrowseOnly=0) or (IsInstalled=0 and IsHidden=0 and BrowseOnly=1)')
+        Write-Log ('ค้นหาจบ | ResultCode {0} | พบ {1} รายการ | ใช้เวลา {2:0.0} วินาที' -f
+            $search.ResultCode,$search.Updates.Count,$phaseTimer.Elapsed.TotalSeconds)
         if ($search.ResultCode -ne 2) { throw "ค้นหา Windows Update ไม่สำเร็จ (ResultCode $($search.ResultCode))" }
         Assert-Running
         if ($search.Updates.Count -eq 0) {
@@ -128,6 +131,7 @@ function Invoke-WindowsUpdateLoop {
         $download = $session.CreateUpdateDownloader()
         $download.Updates = $updates
         Write-Log "กำลังดาวน์โหลด $($updates.Count) รายการ"
+        $phaseTimer.Restart()
         Assert-Running
         try {
             $downloadResult = Invoke-UpdateDownload $download $updates
@@ -138,6 +142,8 @@ function Invoke-WindowsUpdateLoop {
             throw ('ดาวน์โหลด Windows Update ไม่สำเร็จ (HRESULT {0:X8}): {1}' -f $cause.HResult, $cause.Message)
         }
         Assert-Running
+        Write-Log ('ดาวน์โหลดจบ | ResultCode {0} | ใช้เวลา {1:0.0} วินาที' -f
+            $downloadResult.ResultCode,$phaseTimer.Elapsed.TotalSeconds)
         if ($downloadResult.ResultCode -ne 2) {
             for ($i = 0; $i -lt $updates.Count; $i++) {
                 Write-Log ('ดาวน์โหลด {0} HRESULT {1:X8}' -f $updates.Item($i).Title, $downloadResult.GetUpdateResult($i).HResult)
@@ -150,7 +156,10 @@ function Invoke-WindowsUpdateLoop {
         $installer.ForceQuiet = $true
         if ($installer.RebootRequiredBeforeInstallation) { Save-UpdateRestart; return }
         Write-Log 'กำลังติดตั้ง Windows Update'
+        $phaseTimer.Restart()
         $result = $installer.Install()
+        Write-Log ('ติดตั้งจบ | ResultCode {0} | ต้องรีสตาร์ท {1} | ใช้เวลา {2:0.0} วินาที' -f
+            $result.ResultCode,$result.RebootRequired,$phaseTimer.Elapsed.TotalSeconds)
         for ($i = 0; $i -lt $updates.Count; $i++) {
             $item = $result.GetUpdateResult($i)
             Write-Log ('{0} ResultCode {1}, HRESULT {2:X8}' -f $updates.Item($i).Title,$item.ResultCode,$item.HResult)

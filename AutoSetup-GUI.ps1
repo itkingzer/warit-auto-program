@@ -803,13 +803,16 @@ Update-PayloadTaskVisibility
 $events = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 # ส่งสถานะผ่านคิว กิจกรรมที่ใช้เวลานานอยู่ใน Runspace นี้ทั้งหมด
 $worker = {
-    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent)
+    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock)
     $ErrorActionPreference = 'Stop'
     function Publish($Kind, $Value) { $Events.Enqueue(@{ Kind = $Kind; Value = $Value }) }
     function Write-Log([string]$Message) {
         $line = ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f [DateTime]::Now,$Message)
-        [IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine, [Text.Encoding]::UTF8)
-        Publish Log $line
+        [Threading.Monitor]::Enter($LogLock)
+        try {
+            [IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine, [Text.Encoding]::UTF8)
+            Publish Log $line
+        } finally { [Threading.Monitor]::Exit($LogLock) }
     }
     function Assert-Running {
         if ($Cancel.IsCancellationRequested) { throw [OperationCanceledException]::new('ยกเลิกตามคำสั่งผู้ใช้') }
@@ -827,12 +830,15 @@ $worker = {
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $info
         $skip = $null
+        $name = [IO.Path]::GetFileName($File)
         try {
             [void]$process.Start()
+            if (-not $SuppressOutput) {
+                Write-Log "เริ่มโปรเซส $name (PID $($process.Id)) | รอสูงสุด $Timeout วินาที | โฟลเดอร์ $WorkingDirectory"
+            }
             if ($AllowSkip) {
                 $skip = [hashtable]::Synchronized(@{ Requested = $false })
                 Publish InstallerSkip $skip
-                Write-Log "รอตัวติดตั้ง $([IO.Path]::GetFileName($File)) ได้สูงสุด $Timeout วินาที"
             }
             if ($SuppressOutput) {
                 $stdout = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
@@ -842,11 +848,12 @@ $worker = {
                 $stderr = $process.StandardError.ReadToEndAsync()
             }
             $timer = [Diagnostics.Stopwatch]::StartNew()
-            $nextWaitLog = 30
+            $nextWaitLog = 10
             while (-not $process.WaitForExit(250)) {
                 if ($skip.Requested -or $timer.Elapsed.TotalSeconds -ge $Timeout) {
                     $skipped = $skip.Requested
                     $reason = if ($skipped) { 'ข้ามตามคำสั่งผู้ใช้' } else { 'หมดเวลารอ' }
+                    Write-Log "$reason | กำลังหยุด $name (PID $($process.Id))"
                     $kill = Start-Process "$env:SystemRoot\System32\taskkill.exe" -ArgumentList "/PID $($process.Id) /T /F" -WindowStyle Hidden -PassThru
                     try {
                         if (-not $kill.WaitForExit(5000) -or $kill.ExitCode -ne 0 -or -not $process.WaitForExit(5000)) {
@@ -860,18 +867,20 @@ $worker = {
                     }
                     throw "หมดเวลารอ $File ($Timeout วินาที)"
                 }
-                if ($AllowSkip -and $timer.Elapsed.TotalSeconds -ge $nextWaitLog) {
-                    Write-Log "ยังรอตัวติดตั้ง $([IO.Path]::GetFileName($File)) ($nextWaitLog/$Timeout วินาที)"
-                    $nextWaitLog += 30
+                if (-not $SuppressOutput -and $timer.Elapsed.TotalSeconds -ge $nextWaitLog) {
+                    $remaining = [Math]::Max(0, $Timeout - [int]$timer.Elapsed.TotalSeconds)
+                    Write-Log "โปรเซส $name (PID $($process.Id)) ยังทำงาน | รอแล้ว $nextWaitLog วินาที | เหลือก่อนหมดเวลา $remaining วินาที"
+                    $nextWaitLog += 10
                 }
             }
             if (-not $CaptureOutput -and -not $SuppressOutput) {
-                foreach ($stream in $stdout,$stderr) {
-                    if ($stream.Wait(1000) -and $stream.Result.Trim()) { Write-Log $stream.Result.TrimEnd() }
+                foreach ($streamName in 'stdout','stderr') {
+                    $stream = if ($streamName -eq 'stdout') { $stdout } else { $stderr }
+                    if ($stream.Wait(1000) -and $stream.Result.Trim()) { Write-Log "[$name $streamName] $($stream.Result.TrimEnd())" }
                 }
             }
             $code = $process.ExitCode
-            if (-not $SuppressOutput) { Write-Log "$([IO.Path]::GetFileName($File)) Exit Code $code" }
+            if (-not $SuppressOutput) { Write-Log ("{0} Exit Code {1} | ใช้เวลา {2:0.0} วินาที" -f $name,$code,$timer.Elapsed.TotalSeconds) }
             if ($code -notin $SuccessCodes) { throw "$File ทำงานไม่สำเร็จ (Exit Code $code)" }
             if (-not $SuppressOutput -and $code -in 3010,1641) { Write-Log 'ตัวติดตั้งแจ้งว่าต้องรีสตาร์ท' }
             if (-not $IgnoreCancellation) { Assert-Running }
@@ -931,12 +940,15 @@ $worker = {
             . (Join-Path $Root "modules\$module.ps1")
         }
         $completed = 0
+        $queueTimer = [Diagnostics.Stopwatch]::StartNew()
+        Write-Log "เริ่มคิว $($Selected.Count) งาน | $($Selected -join ' → ')"
         $printerIncomplete = $false
         $unavailableCount = 0
         foreach ($key in $Selected) {
             Assert-Running
             Publish Step $key
-            if ($key -ne 'ACDSee') { Write-Log "เริ่ม $key" }
+            $stepTimer = [Diagnostics.Stopwatch]::StartNew()
+            Write-Log "งาน $($completed + 1)/$($Selected.Count) | เริ่ม $key"
             switch ($key) {
                 SMB { Enable-SmbFileSharing }
                 SMB1 { Enable-SetupWindowsFeatures 'SMB1Protocol','SMB1Protocol-Client','SMB1Protocol-Server' }
@@ -957,6 +969,7 @@ $worker = {
                 }
             }
             $completed++
+            Write-Log ("งาน {0}/{1} | จบ {2} | ใช้เวลา {3:0.0} วินาที" -f $completed,$Selected.Count,$key,$stepTimer.Elapsed.TotalSeconds)
             Publish Progress (100.0 * $completed / $Selected.Count)
             if ($script:DriverRestartRequired) { break }
         }
@@ -972,7 +985,7 @@ $worker = {
                 "จบงานแล้ว: ข้าม $unavailableCount รายการ ดูรายละเอียดใน Log"
             }
             else { 'เสร็จสิ้น' }
-        if ($Selected.Count -ne 1 -or $Selected[0] -ne 'ACDSee') { Write-Log $message }
+        Write-Log ("{0} | ผ่านคิว {1}/{2} งาน | ข้าม {3} รายการ | เวลารวม {4:0.0} วินาที" -f $message,$completed,$Selected.Count,$unavailableCount,$queueTimer.Elapsed.TotalSeconds)
         Publish Status $message
         if (-not $script:UpdateRestartPending -and ($Selected | Where-Object { $_ -in 'Apps','Runtimes','Foxit','ACDSee','LINE','Office' })) {
             try { Publish Inventory @(Get-PackageInventory) } catch { Write-Log "ตรวจรายการโปรแกรมซ้ำไม่สำเร็จ: $_" }
@@ -994,7 +1007,8 @@ $worker = {
         if ($key -eq 'Drivers' -and -not $script:DriverRestartRequired) {
             Publish DriverStatus 'งานไดรเวอร์ไม่สำเร็จทั้งหมด ดูรายละเอียดใน Log'
         }
-        Write-Log ("ผิดพลาด: {0}" -f $_.Exception.Message)
+        Write-Log ("ผิดพลาดในงาน {0}: {1} (HRESULT {2:X8})" -f $key,$_.Exception.Message,$_.Exception.HResult)
+        if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace }
         Publish Status 'หยุดเนื่องจากข้อผิดพลาด ดูรายละเอียดใน Log'
     }
 }
@@ -1002,6 +1016,10 @@ $worker = {
 function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     $log = Join-Path $logDir ((Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff') + "_$Mode.log")
     $ui.Mode = $Mode
+    $ui.LogPath = $log
+    $ui.LogLock = [object]::new()
+    $ui.LastLogAt = [DateTime]::UtcNow
+    $ui.StageTimer = [Diagnostics.Stopwatch]::StartNew()
     $ui.Token = [Threading.CancellationTokenSource]::new()
     $ui.Space = [RunspaceFactory]::CreateRunspace()
     # Keep synchronous WUA COM calls on an MTA worker. WPF stays on the GUI thread.
@@ -1013,7 +1031,7 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     [void]$ui.Work.AddScript($worker.ToString())
     [void]$ui.Work.AddArgument($Root).AddArgument($Config).AddArgument($PayloadFolders).AddArgument($StatePath).
         AddArgument($ResumeTask).AddArgument($events).AddArgument($ui.Token.Token).AddArgument($Selected).
-        AddArgument($log).AddArgument($Mode).AddArgument($DataPercent)
+        AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock)
     $ui.Handle = $ui.Work.BeginInvoke()
     $poll.Start()
 }
@@ -1046,6 +1064,7 @@ $poll.Add_Tick({
         while ($events.TryDequeue([ref]$eventItem)) {
             switch ($eventItem.Kind) {
                 Log {
+                    $ui.LastLogAt = [DateTime]::UtcNow
                     $followLog = ($controls.LogBox.ExtentHeight - $controls.LogBox.ViewportHeight - $controls.LogBox.VerticalOffset) -le 1
                     $controls.LogBox.AppendText([string]$eventItem.Value + [Environment]::NewLine)
                     if ($controls.LogBox.Text.Length -gt 200000) {
@@ -1054,6 +1073,7 @@ $poll.Add_Tick({
                     if ($followLog) { $controls.LogBox.ScrollToEnd() }
                 }
                 Step {
+                    $ui.StageTimer.Restart()
                     if (-not $ui.Token.IsCancellationRequested) {
                         $ui.StatusBeforeWait = $null
                         $controls.Status.Text = $choices[$eventItem.Value][0]
@@ -1128,6 +1148,18 @@ $poll.Add_Tick({
                 }
                 ResumeCleared { if ($ui.Resume) { $ui.ResumeFinished = $true } }
             }
+        }
+        if ($ui.Handle -and -not $ui.Handle.IsCompleted -and
+            ([DateTime]::UtcNow - $ui.LastLogAt).TotalSeconds -ge 15) {
+            $line = '[{0:yyyy-MM-dd HH:mm:ss}] ยังรอผล | {1} | ผ่านไป {2:0} วินาที | ยังไม่มีข้อมูลความคืบหน้าเพิ่ม' -f
+                [DateTime]::Now,$controls.Status.Text,$ui.StageTimer.Elapsed.TotalSeconds
+            [Threading.Monitor]::Enter($ui.LogLock)
+            try {
+                if ($events.IsEmpty) {
+                    [IO.File]::AppendAllText($ui.LogPath, $line + [Environment]::NewLine, [Text.Encoding]::UTF8)
+                    $events.Enqueue(@{ Kind = 'Log'; Value = $line })
+                }
+            } finally { [Threading.Monitor]::Exit($ui.LogLock) }
         }
         if ($ui.Handle -and $ui.Handle.IsCompleted -and $events.IsEmpty) {
             $poll.Stop()
