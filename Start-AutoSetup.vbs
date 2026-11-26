@@ -7,7 +7,7 @@ root = files.GetParentFolderName(WScript.ScriptFullName)
 
 command = Quote(shell.ExpandEnvironmentStrings("%SystemRoot%") & _
     "\System32\WindowsPowerShell\v1.0\powershell.exe") & _
-    " -NoProfile -STA -ExecutionPolicy RemoteSigned -File " & _
+    " -NoProfile -STA -ExecutionPolicy Bypass -File " & _
     Quote(files.BuildPath(root, "AutoSetup-GUI.ps1"))
 
 For Each argument In WScript.Arguments

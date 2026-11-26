@@ -19,14 +19,14 @@ $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -or $exe -like '*Sysnative*') {
     $launch = @{
         FilePath = $exe
-        ArgumentList = '-NoProfile -STA -ExecutionPolicy RemoteSigned -File "{0}"' -f $PSCommandPath
+        ArgumentList = '-NoProfile -STA -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
         WorkingDirectory = $Root
         WindowStyle = 'Hidden'
     }
     if ($ResumeOnly) { $launch.ArgumentList += ' -ResumeOnly' }
     if (-not $admin) { $launch.Verb = 'RunAs' }
-    Start-Process @launch
-    return
+    $child = Start-Process @launch -Wait -PassThru
+    try { exit $child.ExitCode } finally { $child.Dispose() }
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $windowTitle = 'Warit · Windows Auto Setup'
