@@ -7,9 +7,21 @@
     if ($task) { Unregister-ScheduledTask -InputObject $task -Confirm:$false }
 }
 
-function Save-UpdateRestart {
+function Save-UpdateRestart([object[]]$UpdateList, [hashtable]$Processed, [string]$Reason) {
     Assert-Running
+    Write-Log "ต้องรีสตาร์ท Windows | $Reason | เหลือ $($UpdateList.Count) รายการในรอบนี้"
     $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
+    $bootId = $boot.ToUniversalTime().Ticks.ToString()
+    $next = $UpdateList | Select-Object -First 1
+    $restartKey = "$Reason|$($UpdateList.Count)|$($next.Key)"
+    if (Test-Path -LiteralPath $StatePath -PathType Leaf) {
+        $previous = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($previous.Mode -eq 'UpdateLoop' -and $previous.RestartKey -eq $restartKey -and
+            ($previous.RestartFromBoot -ne $bootId -or $previous.AutoRestartBlocked -eq $true)) {
+            $script:UpdateAutoRestartBlocked = $true
+            Write-Log 'Windows ขอรีสตาร์ทซ้ำโดยคิวไม่เดินหน้า ระงับการรีสตาร์ทอัตโนมัติรอบนี้'
+        }
+    }
     # ใช้บัญชีเดิมและเปิดหน้าต่างเมื่อบัญชีนั้นเข้าสู่ระบบหลังรีสตาร์ท
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $launcher = Join-Path $Root 'Start-AutoSetup.vbs'
@@ -18,15 +30,24 @@ function Save-UpdateRestart {
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $ResumeTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Save-UpdateState @{ Mode = 'UpdateLoop'; RestartFromBoot = $boot.ToUniversalTime().Ticks.ToString() }
-    Write-Log 'บันทึกสถานะสำหรับทำ Windows Update ต่อหลังรีสตาร์ทแล้ว'
+    Save-UpdateState @{
+        Mode = 'UpdateLoop'
+        RestartFromBoot = $bootId
+        RestartKey = $restartKey
+        AutoRestartBlocked = [bool]$script:UpdateAutoRestartBlocked
+        UpdateList = @($UpdateList)
+        ProcessedUpdateKeys = @($Processed.Keys)
+        UpdateFailures = @($Processed.GetEnumerator() | Where-Object { $_.Value -is [string] } |
+            ForEach-Object { @{ Key = $_.Key; Message = $_.Value } })
+    }
+    Write-Log 'บันทึกคิวแล้ว เมื่อเข้าบัญชีเดิมหลังรีสตาร์ทจะทำรายการที่เหลือและตรวจอัปเดตต่อ'
     $script:UpdateRestartPending = $true
 }
 
 function Save-UpdateState([hashtable]$State) {
     $temp = "$StatePath.tmp"
     try {
-        [IO.File]::WriteAllText($temp, ($State | ConvertTo-Json))
+        [IO.File]::WriteAllText($temp, ($State | ConvertTo-Json -Depth 5))
         if ([IO.File]::Exists($StatePath)) {
             [IO.File]::Replace($temp, $StatePath, [NullString]::Value)
         }
@@ -36,7 +57,7 @@ function Save-UpdateState([hashtable]$State) {
     }
 }
 
-function Invoke-UpdateDownload($Downloader, $Updates) {
+function New-UpdateCallback {
     if (-not ('Warit.UpdateDownloadCallback' -as [type])) {
         Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
@@ -57,24 +78,43 @@ namespace Warit {
 }
 '@
     }
-    # WUA invokes the callbacks on COM threads. Read progress on the setup worker.
-    $callback = [Warit.UpdateDownloadCallback]::new()
+    return [Warit.UpdateDownloadCallback]::new()
+}
+
+function Publish-UpdateItem($Item, [string]$Status, [switch]$Active) {
+    Publish UpdateItem @{ Key = $Item.Key; Title = $Item.Title; Status = $Status; Active = [bool]$Active }
+}
+
+function Invoke-UpdateDownload($Downloader, $Updates, $UpdateItem) {
+    $callback = New-UpdateCallback
     $percentages = @{}
     for ($i = 0; $i -lt $Updates.Count; $i++) {
         $percentages[$i] = 0
         Write-Log "ดาวน์โหลด 0% — $($Updates.Item($i).Title)"
     }
     $job = $Downloader.BeginDownload($callback, $callback, $null)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $idle = [Diagnostics.Stopwatch]::StartNew()
+    $lastBytes = $null
     try {
         while (-not $job.IsCompleted) {
             Assert-Running
+            if ($timer.Elapsed.TotalSeconds -ge 2700) { throw "Windows Update หมดเวลารอดาวน์โหลด (45 นาที)" }
             $progress = $job.GetProgress()
+            $bytes = $progress.TotalBytesDownloaded
+            if ($bytes -ne $lastBytes) {
+                $lastBytes = $bytes
+                $idle.Restart()
+            }
             $index = [int]$progress.CurrentUpdateIndex
             $percent = [int]$progress.CurrentUpdatePercentComplete
             if ($percentages.ContainsKey($index) -and $percent -gt $percentages[$index] -and $percent -lt 100) {
                 $percentages[$index] = $percent
+                $idle.Restart()
                 Write-Log "ดาวน์โหลด $percent% — $($Updates.Item($index).Title)"
+                Publish-UpdateItem $UpdateItem "กำลังดาวน์โหลด $percent%" -Active
             }
+            if ($idle.Elapsed.TotalSeconds -ge 600) { throw 'ดาวน์โหลด Windows Update ไม่มีความคืบหน้า 10 นาที' }
             Start-Sleep -Milliseconds 500
         }
         $result = $Downloader.EndDownload($job)
@@ -86,86 +126,206 @@ namespace Warit {
         }
         return $result
     } finally {
-        if (-not $job.IsCompleted) { $job.RequestAbort() }
-        $job.CleanUp()
+        Close-UpdateJob $job
     }
 }
 
-function Invoke-WindowsUpdateLoop {
-    # เลือกอัปเดตที่แหล่ง Windows Update ของเครื่องเสนอและยังไม่ได้ติดตั้ง
+function Wait-UpdateJob($Job, [string]$Phase, [int]$TimeoutSeconds, $UpdateItem) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $lastPercent = -1
+    while (-not $Job.IsCompleted) {
+        Assert-Running
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Windows Update หมดเวลารอ $Phase ($TimeoutSeconds วินาที)" }
+        if ($UpdateItem) {
+            $percent = $Job.GetProgress().PercentComplete
+            if ($percent -ne $lastPercent) {
+                $lastPercent = $percent
+                Write-Log "$Phase | $percent%"
+                Publish-UpdateItem $UpdateItem "กำลังติดตั้ง $percent%" -Active
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+function Close-UpdateJob($Job) {
+    try {
+        if ($Job.IsCompleted) { $Job.CleanUp(); return }
+        $Job.RequestAbort()
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $Job.IsCompleted -and $timer.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 250 }
+        if ($Job.IsCompleted) { $Job.CleanUp() }
+        else { Write-Log 'ส่งคำขอหยุดแล้ว Windows Update ยังไม่ยืนยันว่าหยุด ตรวจสถานะใน Settings ก่อนเริ่มงานใหม่' }
+    } catch {
+        Write-Log "ปิดงาน Windows Update ไม่สำเร็จ: $($_.Exception.Message)"
+    }
+}
+
+function Search-SetupUpdates($Session, [switch]$Online) {
+    $searcher = $Session.CreateUpdateSearcher()
+    $searcher.Online = [bool]$Online
+    $callback = New-UpdateCallback
+    $criteria = '(IsInstalled=0 and IsHidden=0 and BrowseOnly=0) or (IsInstalled=0 and IsHidden=0 and BrowseOnly=1)'
+    $phase = if ($Online) { 'ค้นหาออนไลน์' } else { 'ตรวจรายการที่บันทึกกับแคช Windows Update' }
+    Write-Log "Windows Update: $phase"
+    Publish UpdateActivity "กำลัง$phase"
+    Assert-Running
+    $job = $searcher.BeginSearch($criteria, $callback, $null)
+    try {
+        Wait-UpdateJob $job $phase 600
+        $result = $searcher.EndSearch($job)
+        Assert-Running
+        if ($result.ResultCode -ne 2) { throw "ค้นหา Windows Update ไม่สำเร็จ (ResultCode $($result.ResultCode))" }
+        Write-Log "Windows Update: $phase จบ พบ $($result.Updates.Count) รายการ"
+        return $result
+    } finally { Close-UpdateJob $job }
+}
+
+function Get-SetupUpdateList([ref]$ManualTitles) {
     $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $searcher.Online = $true
-    $seen = @{}
-    while ($true) {
+    $search = Search-SetupUpdates $session -Online
+    foreach ($update in $search.Updates) {
         Assert-Running
-        $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-        if ($systemInfo.RebootRequired) { Save-UpdateRestart; return }
-        Write-Log 'กำลังค้นหา Windows Update รวมอัปเดตเสริมและไดรเวอร์'
-        $phaseTimer = [Diagnostics.Stopwatch]::StartNew()
-        $search = $searcher.Search('(IsInstalled=0 and IsHidden=0 and BrowseOnly=0) or (IsInstalled=0 and IsHidden=0 and BrowseOnly=1)')
-        Write-Log ('ค้นหาจบ | ResultCode {0} | พบ {1} รายการ | ใช้เวลา {2:0.0} วินาที' -f
-            $search.ResultCode,$search.Updates.Count,$phaseTimer.Elapsed.TotalSeconds)
-        if ($search.ResultCode -ne 2) { throw "ค้นหา Windows Update ไม่สำเร็จ (ResultCode $($search.ResultCode))" }
+        if ($update.InstallationBehavior.CanRequestUserInput) {
+            Write-Log "ข้ามรายการที่ต้องตอบโต้: $($update.Title)"
+            if ($null -ne $ManualTitles) { $ManualTitles.Value += [string]$update.Title }
+            continue
+        }
+        $key = "$($update.Identity.UpdateID)/$($update.Identity.RevisionNumber)"
+        Write-Log "พบ $($update.Title) | $key"
+        [pscustomobject]@{ Key = $key; Title = [string]$update.Title }
+    }
+}
+
+function Invoke-WindowsUpdateBatch([object[]]$UpdateList, [hashtable]$Processed) {
+    Assert-Running
+    if (-not $UpdateList.Count) { return }
+    $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+    if ($systemInfo.RebootRequired) {
+        Save-UpdateRestart $UpdateList $Processed 'Windows Update แจ้งว่ามีงานก่อนหน้ารอรีสตาร์ท'
+        return
+    }
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $search = Search-SetupUpdates $session
+    $available = @{}
+    $skipped = 0
+    foreach ($update in $search.Updates) {
+        $available["$($update.Identity.UpdateID)/$($update.Identity.RevisionNumber)"] = $update
+    }
+    if ($UpdateList | Where-Object { -not $available.ContainsKey($_.Key) } | Select-Object -First 1) {
+        Write-Log 'บางรายการหายจากแคช ตรวจความพร้อมออนไลน์อีกครั้ง โดยคงรายการและรุ่นที่ยืนยันไว้'
+        $search = Search-SetupUpdates $session -Online
+        $available.Clear()
+        foreach ($update in $search.Updates) {
+            $available["$($update.Identity.UpdateID)/$($update.Identity.RevisionNumber)"] = $update
+        }
+    }
+    for ($i = 0; $i -lt $UpdateList.Count; $i++) {
         Assert-Running
-        if ($search.Updates.Count -eq 0) {
-            Clear-UpdateResume
-            Write-Log 'ไม่มี Windows Update ที่เข้าเงื่อนไขเหลือแล้ว'
-            return
+        $item = $UpdateList[$i]
+        $update = $available[$item.Key]
+        $itemStatus = "รายการ $($i + 1)/$($UpdateList.Count) — $($item.Title)"
+        Write-Log "Windows Update | $itemStatus"
+        Publish-UpdateItem $item 'กำลังเตรียมรายการ' -Active
+        if (-not $update -or $update.IsInstalled -or $update.InstallationBehavior.CanRequestUserInput) {
+            $skipped++
+            $Processed[$item.Key] = $true
+            Write-Log 'ข้ามรายการนี้ เพราะติดตั้งแล้วหรือไม่มีรายการรุ่นเดิมที่ติดตั้งอัตโนมัติได้ในแคช'
+            Publish-UpdateItem $item 'ข้ามรายการ (ดู Log)'
+            continue
         }
         $updates = New-Object -ComObject Microsoft.Update.UpdateColl
-        # แยกอัปเดตที่ WUA กำหนดให้ลงทีละตัวออกจากชุดรวม
-        $exclusive = $false
-        foreach ($update in $search.Updates) {
-            $isExclusive = $update.InstallationBehavior.Impact -eq 2
-            if ($update.InstallationBehavior.CanRequestUserInput -or ($isExclusive -and $updates.Count -gt 0) -or $exclusive) { continue }
-            $key = "$($update.Identity.UpdateID)/$($update.Identity.RevisionNumber)"
-            if ($seen.ContainsKey($key)) { throw "Windows Update เสนอรายการเดิมหลังติดตั้ง: $($update.Title)" }
-            $seen[$key] = $true
-            if (-not $update.EulaAccepted) { $update.AcceptEula() }
-            [void]$updates.Add($update)
-            $exclusive = $isExclusive
-            Write-Log "เลือกอัปเดต $($update.Title)"
-        }
-        if ($updates.Count -eq 0) { throw 'อัปเดตที่เหลือต้องการการโต้ตอบจากผู้ใช้' }
-        $download = $session.CreateUpdateDownloader()
-        $download.Updates = $updates
-        Write-Log "กำลังดาวน์โหลด $($updates.Count) รายการ"
-        $phaseTimer.Restart()
-        Assert-Running
-        try {
-            $downloadResult = Invoke-UpdateDownload $download $updates
-        } catch [OperationCanceledException] {
-            throw
-        } catch {
-            $cause = $_.Exception.GetBaseException()
-            throw ('ดาวน์โหลด Windows Update ไม่สำเร็จ (HRESULT {0:X8}): {1}' -f $cause.HResult, $cause.Message)
-        }
-        Assert-Running
-        Write-Log ('ดาวน์โหลดจบ | ResultCode {0} | ใช้เวลา {1:0.0} วินาที' -f
-            $downloadResult.ResultCode,$phaseTimer.Elapsed.TotalSeconds)
-        if ($downloadResult.ResultCode -ne 2) {
-            for ($i = 0; $i -lt $updates.Count; $i++) {
-                Write-Log ('ดาวน์โหลด {0} HRESULT {1:X8}' -f $updates.Item($i).Title, $downloadResult.GetUpdateResult($i).HResult)
+        [void]$updates.Add($update)
+        if (-not $update.EulaAccepted) { $update.AcceptEula() }
+        if ($update.IsDownloaded) { Write-Log "ดาวน์โหลด 100% — $($item.Title) (มีไฟล์แล้ว)" }
+        else {
+            Publish-UpdateItem $item 'กำลังดาวน์โหลด' -Active
+            $download = $session.CreateUpdateDownloader()
+            $download.Updates = $updates
+            $downloadResult = Invoke-UpdateDownload $download $updates $item
+            $downloadItem = $downloadResult.GetUpdateResult(0)
+            if ($downloadItem.ResultCode -ne 2) {
+                $failure = 'ดาวน์โหลด {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f
+                    $item.Title,$downloadItem.ResultCode,$downloadItem.HResult
+                $Processed[$item.Key] = $failure
+                Write-Log $failure
+                Publish-UpdateItem $item ('ดาวน์โหลดไม่สำเร็จ (0x{0:X8})' -f $downloadItem.HResult)
+                continue
             }
-            throw "ดาวน์โหลด Windows Update ไม่สำเร็จ (ResultCode $($downloadResult.ResultCode))"
         }
+        Assert-Running
         $installer = $session.CreateUpdateInstaller()
         $installer.Updates = $updates
         $installer.AllowSourcePrompts = $false
         $installer.ForceQuiet = $true
-        if ($installer.RebootRequiredBeforeInstallation) { Save-UpdateRestart; return }
-        Write-Log 'กำลังติดตั้ง Windows Update'
-        $phaseTimer.Restart()
-        $result = $installer.Install()
-        Write-Log ('ติดตั้งจบ | ResultCode {0} | ต้องรีสตาร์ท {1} | ใช้เวลา {2:0.0} วินาที' -f
-            $result.ResultCode,$result.RebootRequired,$phaseTimer.Elapsed.TotalSeconds)
-        for ($i = 0; $i -lt $updates.Count; $i++) {
-            $item = $result.GetUpdateResult($i)
-            Write-Log ('{0} ResultCode {1}, HRESULT {2:X8}' -f $updates.Item($i).Title,$item.ResultCode,$item.HResult)
+        if ($installer.RebootRequiredBeforeInstallation) {
+            Publish-UpdateItem $item 'รอรีสตาร์ตก่อนติดตั้ง'
+            Save-UpdateRestart @($UpdateList | Select-Object -Skip $i) $Processed "ต้องรีสตาร์ทก่อนติดตั้ง $($item.Title)"
+            return
         }
+        Write-Log "กำลังติดตั้ง $($item.Title)"
+        Publish-UpdateItem $item 'กำลังติดตั้ง' -Active
+        $callback = New-UpdateCallback
+        $job = $installer.BeginInstall($callback, $callback, $null)
+        try {
+            Wait-UpdateJob $job "กำลังติดตั้ง $itemStatus" 5400 $item
+            $result = $installer.EndInstall($job)
+        } finally { Close-UpdateJob $job }
+        $installed = $result.GetUpdateResult(0)
+        Write-Log ('{0} | ResultCode {1} | HRESULT {2:X8} | รีสตาร์ท {3}' -f $item.Title,$installed.ResultCode,$installed.HResult,$result.RebootRequired)
+        $Processed[$item.Key] = if ($installed.ResultCode -eq 2) { $true } else {
+            'ติดตั้ง {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f $item.Title,$installed.ResultCode,$installed.HResult
+        }
+        $needsRestart = $result.RebootRequired -or $installed.RebootRequired
+        $itemResult = if ($installed.ResultCode -ne 2) { 'ติดตั้งไม่สำเร็จ (0x{0:X8})' -f $installed.HResult }
+            elseif ($needsRestart) { 'ติดตั้งแล้ว รอรีสตาร์ต' }
+            else { 'ติดตั้งเสร็จแล้ว' }
+        Publish-UpdateItem $item $itemResult
+        if ($needsRestart) {
+            Save-UpdateRestart @($UpdateList | Select-Object -Skip ($i + 1)) $Processed "ผลการติดตั้ง $($item.Title) แจ้งว่าต้องรีสตาร์ท"
+            return
+        }
+    }
+    Write-Log "ประมวลผลครบตามรายการที่ตรวจไว้ | ข้าม $skipped รายการ"
+}
+
+function Invoke-WindowsUpdateLoop([object[]]$UpdateList, [string[]]$ProcessedUpdateKeys, [object[]]$UpdateFailures) {
+    $processed = @{}
+    foreach ($key in $ProcessedUpdateKeys) { $processed[$key] = $true }
+    foreach ($failure in $UpdateFailures) { $processed[$failure.Key] = [string]$failure.Message }
+    $round = 0
+    while ($true) {
         Assert-Running
-        if ($result.RebootRequired) { Save-UpdateRestart; return }
-        if ($result.ResultCode -ne 2) { throw "ติดตั้ง Windows Update ไม่สำเร็จ (ResultCode $($result.ResultCode))" }
+        if ($UpdateList.Count) {
+            $round++
+            Write-Log "Windows Update รอบ $round | $($UpdateList.Count) รายการ"
+            Publish UpdateQueued $UpdateList
+            Invoke-WindowsUpdateBatch $UpdateList $processed
+            if ($script:UpdateRestartPending) { return }
+        }
+
+        $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+        if ($systemInfo.RebootRequired) {
+            Save-UpdateRestart @() $processed 'Windows Update แจ้งว่าต้องรีสตาร์ทก่อนตรวจรอบถัดไป'
+            return
+        }
+        $checking = 'กำลังตรวจ Windows Update อีกครั้งเพื่อหาอัปเดตที่เหลือ'
+        Write-Log $checking
+        $manualTitles = @()
+        $offered = @(Get-SetupUpdateList ([ref]$manualTitles))
+        $UpdateList = @($offered | Where-Object {
+            if ($processed.ContainsKey($_.Key)) { Write-Log "Windows ยังเสนอรายการเดิม: $($_.Title) | ข้ามการลองซ้ำ" }
+            else { $true }
+        })
+        if (-not $UpdateList.Count) {
+            Clear-UpdateResume
+            Publish ResumeCleared $true
+            $failures = @($processed.Values | Where-Object { $_ -is [string] })
+            foreach ($failure in $failures) { Write-Log "สรุปข้อผิดพลาด: $failure" }
+            if ($failures.Count) { throw "Windows Update ประมวลผลรายการอื่นต่อแล้ว แต่มี $($failures.Count) รายการที่ไม่สำเร็จ ดูรายละเอียดใน Log" }
+            if ($offered.Count) { throw 'Windows Update ยังเสนอเฉพาะรายการเดิม หยุดวนซ้ำ ดูชื่อรายการใน Log' }
+            Write-Log 'ตรวจซ้ำแล้วไม่พบอัปเดตที่ติดตั้งอัตโนมัติได้ ปิดการเปิดต่อหลังรีสตาร์ทแล้ว'
+            return [pscustomobject]@{ ManualTitles = $manualTitles }
+        }
     }
 }

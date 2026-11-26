@@ -54,11 +54,20 @@ if (-not $locked) {
 try {
 $ResumeTask = 'WaritAutoSetup-WindowsUpdateResume'
 $resume = $false
+$resumeUpdates = @()
+$resumeProcessedUpdateKeys = @()
+$resumeUpdateFailures = @()
 if (Test-Path -LiteralPath $StatePath) {
     $updateState = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $mode = $updateState.Mode
     if ($mode -notin 'Idle','UpdateLoop') { throw "state.json มี Mode ที่ไม่รองรับ: $mode" }
-    if ($mode -eq 'UpdateLoop') {
+    if ($mode -eq 'UpdateLoop' -and -not $updateState.PSObject.Properties['UpdateList']) {
+        . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
+        Clear-UpdateResume
+    } elseif ($mode -eq 'UpdateLoop') {
+        $resumeUpdates = @($updateState.UpdateList | Where-Object { $_ })
+        $resumeProcessedUpdateKeys = @($updateState.ProcessedUpdateKeys | Where-Object { $_ })
+        $resumeUpdateFailures = @($updateState.UpdateFailures | Where-Object { $_ })
         $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
         $restartFromBoot = $updateState.RestartFromBoot
         $resume = if ($restartFromBoot) {
@@ -79,7 +88,12 @@ if ($ResumeOnly) {
     Save-UpdateState @{
         Mode = 'UpdateLoop'
         RestartFromBoot = $restartFromBoot
+        RestartKey = $updateState.RestartKey
+        AutoRestartBlocked = $updateState.AutoRestartBlocked
         LastResumeBoot = $resumeBoot
+        UpdateList = $resumeUpdates
+        ProcessedUpdateKeys = $resumeProcessedUpdateKeys
+        UpdateFailures = $resumeUpdateFailures
     }
 }
 $configPath = Join-Path $Root 'config.json'
@@ -107,7 +121,7 @@ $choices = [ordered]@{
     LINE = @('LINE (ติดตั้งเงียบผ่าน WinGet · ใช้อินเทอร์เน็ต)', $false)
     Office = @('Office 2024 ProPlus Retail', $false)
     Drivers = @('ค้นหาและติดตั้งไดรเวอร์จาก Windows Update', $false)
-    Update = @('Windows Update', $true)
+    Update = @('Windows Update จากรายการที่ตรวจไว้', $false)
 }
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -505,13 +519,22 @@ $choices = [ordered]@{
                   </StackPanel>
                 </ScrollViewer>
               </TabItem>
-              <TabItem Header="ไดรเวอร์">
+              <TabItem Header="Windows Update และไดรเวอร์">
                 <DockPanel>
-                  <Button Name="ScanDrivers" DockPanel.Dock="Top" HorizontalAlignment="Left" Content="ตรวจไดรเวอร์"/>
-                  <TextBlock Name="DriverSummary" DockPanel.Dock="Top" Margin="0,9" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"
-                             Text="ปุ่มนี้ตรวจอย่างเดียว ไม่ติดตั้ง หากต้องการติดตั้ง ให้เลือกงานไดรเวอร์ในแผนการตั้งค่า"/>
                   <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel>
+                      <TextBlock Text="Windows Update" Style="{StaticResource Section}"/>
+                      <WrapPanel Margin="0,0,0,8">
+                        <Button Name="ScanUpdates" Content="ตรวจอัปเดต" Margin="0,0,8,0"/>
+                        <Button Name="InstallUpdates" Content="ติดตั้งและตรวจต่อจนหมด" IsEnabled="False"/>
+                      </WrapPanel>
+                      <TextBlock Name="UpdateSummary" Text="กดตรวจอัปเดตก่อนเริ่มติดตั้ง" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Name="UpdateTiming" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,0,0,8"
+                                 Foreground="{DynamicResource MutedBrush}"/>
+                      <TextBlock Name="AvailableUpdates" TextWrapping="Wrap" Margin="0,0,0,16"/>
+                      <Button Name="ScanDrivers" HorizontalAlignment="Left" Content="ตรวจไดรเวอร์"/>
+                      <TextBlock Name="DriverSummary" Margin="0,9" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"
+                                 Text="หากต้องการติดตั้งไดรเวอร์ ให้เลือกงานไดรเวอร์ในแผนการตั้งค่า"/>
                       <TextBlock Text="อุปกรณ์ที่ยังไม่มีไดรเวอร์" Style="{StaticResource Section}"/>
                       <TextBlock Name="MissingDrivers" Text="ยังไม่ได้ตรวจ" TextWrapping="Wrap"/>
                       <TextBlock Text="รายการจาก Windows Update" Style="{StaticResource Section}"/>
@@ -622,6 +645,7 @@ foreach ($name in 'StartButton','CancelButton','RestartButton','LogsButton','Opt
 $controls.CheckPayload = $Window.FindName('CheckPayload')
 $controls.PayloadReportPane = $Window.FindName('PayloadReportPane')
 $controls.SkipInstallerButton = $Window.FindName('SkipInstallerButton')
+foreach ($name in 'ScanUpdates','InstallUpdates','UpdateSummary','UpdateTiming','AvailableUpdates') { $controls[$name] = $Window.FindName($name) }
 $controls.PayloadReport = $Window.FindName('PayloadReport')
 $controls.OpenOfficeInstaller = $Window.FindName('OpenOfficeInstaller')
 $controls.OpenOfficeTool = $Window.FindName('OpenOfficeTool')
@@ -732,6 +756,14 @@ foreach ($key in $choices.Keys) {
     $box.IsChecked = if ($resume) { $key -eq 'Update' } else { $choices[$key][1] }
     $checks[$key] = $box
     [void]$groupTasks.Children.Add($box)
+    if ($key -eq 'Update') {
+        $openUpdates = [Windows.Controls.Button]::new()
+        $openUpdates.Content = 'ดูรายการและตรวจอัปเดต…'
+        $openUpdates.HorizontalAlignment = 'Left'
+        $openUpdates.Margin = [Windows.Thickness]::new(24, 0, 0, 4)
+        $openUpdates.Add_Click({ Show-DetailsDrawer $controls.DriversNav })
+        [void]$groupTasks.Children.Add($openUpdates)
+    }
     if ($key -eq 'Apps') {
         $appPicker = [Windows.Controls.Button]::new()
         $appPicker.Content = 'เลือกรายการโปรแกรม…'
@@ -746,7 +778,7 @@ function Update-SelectionSummary {
     $visible = @($checks.Values | Where-Object Visibility -eq 'Visible')
     $count = @($visible | Where-Object IsChecked).Count
     $controls.SelectionCount.Text = "เลือก $count จาก $($visible.Count) งาน"
-    $controls.StartButton.IsEnabled = $count -gt 0 -and -not $ui.Handle -and -not $ui.Reboot -and -not $ui.ResumeFinished
+    $controls.StartButton.IsEnabled = $count -gt 0 -and -not $ui.Handle -and -not $ui.Reboot
 }
 function Update-PayloadTaskVisibility {
     $payload = Join-Path $Root 'payloads'
@@ -771,7 +803,10 @@ function Update-PayloadTaskVisibility {
         Where-Object Visibility -eq 'Visible') { 'Visible' } else { 'Collapsed' }
     Update-SelectionSummary
 }
-$ui = @{ Work = $null; Space = $null; Handle = $null; Token = $null; Mode = ''; Resume = $resume }
+$ui = @{
+    Work = $null; Space = $null; Handle = $null; Token = $null; Mode = ''; Resume = $resume
+    UpdateRows = [ordered]@{}; UpdateManualTitles = @()
+}
 foreach ($box in $checks.Values) {
     $box.Add_Checked({ Update-SelectionSummary })
     $box.Add_Unchecked({ Update-SelectionSummary })
@@ -803,7 +838,7 @@ Update-PayloadTaskVisibility
 $events = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 # ส่งสถานะผ่านคิว กิจกรรมที่ใช้เวลานานอยู่ใน Runspace นี้ทั้งหมด
 $worker = {
-    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock)
+    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures)
     $ErrorActionPreference = 'Stop'
     function Publish($Kind, $Value) { $Events.Enqueue(@{ Kind = $Kind; Value = $Value }) }
     function Write-Log([string]$Message) {
@@ -921,6 +956,21 @@ $worker = {
         Publish Inventory @(Get-PackageInventory)
         return
     }
+    if ($WorkerMode -eq 'UpdateScan') {
+        . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
+        try {
+            $manualTitles = @()
+            $list = @(Get-SetupUpdateList ([ref]$manualTitles))
+            $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+            Publish UpdateList @{ Items = $list; ManualTitles = $manualTitles; RebootRequired = $systemInfo.RebootRequired }
+        } catch [OperationCanceledException] {
+            Publish UpdateScanError 'ยกเลิกการตรวจอัปเดตแล้ว'
+        } catch {
+            Write-Log $_.Exception.Message
+            Publish UpdateScanError "ตรวจอัปเดตไม่สำเร็จ: $($_.Exception.Message)"
+        }
+        return
+    }
     if ($WorkerMode -eq 'DriverScan') {
         . (Join-Path $Root 'modules\05-HardwareAndDrivers.ps1')
         try {
@@ -944,6 +994,7 @@ $worker = {
         Write-Log "เริ่มคิว $($Selected.Count) งาน | $($Selected -join ' → ')"
         $printerIncomplete = $false
         $unavailableCount = 0
+        $updateResult = $null
         foreach ($key in $Selected) {
             Assert-Running
             Publish Step $key
@@ -963,7 +1014,15 @@ $worker = {
                 Printer { $printerIncomplete = -not (Invoke-PrinterFix) }
                 Fonts { Install-LocalFonts }
                 Drivers { Invoke-DriverCheck -Install }
-                Update { Invoke-WindowsUpdateLoop }
+                Update {
+                    Publish UpdateStarted $true
+                    $updateResult = Invoke-WindowsUpdateLoop $UpdateList $ProcessedUpdateKeys $UpdateFailures
+                    if ($script:UpdateRestartPending) {
+                        Publish UpdateStatus 'รอรีสตาร์ท Windows บันทึกคิวไว้แล้ว'
+                    } else {
+                        Publish UpdateComplete $updateResult
+                    }
+                }
                 default {
                     Invoke-PayloadGroup $key -SkipMissing -UnavailableCount ([ref]$unavailableCount)
                 }
@@ -974,7 +1033,8 @@ $worker = {
             if ($script:DriverRestartRequired) { break }
         }
         Assert-Running
-        $autoRestart = $script:UpdateRestartPending -and $completed -eq $Selected.Count -and -not $printerIncomplete
+        $autoRestart = $script:UpdateRestartPending -and -not $script:UpdateAutoRestartBlocked -and
+            $completed -eq $Selected.Count -and -not $printerIncomplete
         $message = if ($autoRestart) { 'งานที่เลือกเสร็จแล้ว กำลังรีสตาร์ทเพื่อทำ Windows Update ต่อ' }
             elseif ($script:UpdateRestartPending) { 'กดรีสตาร์ทเครื่องและยืนยัน เพื่อทำ Windows Update ต่อ' }
             elseif ($script:DriverRestartRequired) { 'ต้องรีสตาร์ทเครื่องก่อนทำงานที่เหลือ' }
@@ -984,6 +1044,10 @@ $worker = {
             elseif ($unavailableCount -gt 0) {
                 "จบงานแล้ว: ข้าม $unavailableCount รายการ ดูรายละเอียดใน Log"
             }
+            elseif ($updateResult -and $Selected.Count -eq 1) {
+                if ($updateResult.ManualTitles.Count) { "ติดตั้งอัตโนมัติเสร็จ เหลือ $($updateResult.ManualTitles.Count) รายการที่ต้องดำเนินการเอง" }
+                else { 'ตรวจซ้ำแล้ว ไม่พบอัปเดตที่เหลือ' }
+            }
             else { 'เสร็จสิ้น' }
         Write-Log ("{0} | ผ่านคิว {1}/{2} งาน | ข้าม {3} รายการ | เวลารวม {4:0.0} วินาที" -f $message,$completed,$Selected.Count,$unavailableCount,$queueTimer.Elapsed.TotalSeconds)
         Publish Status $message
@@ -992,14 +1056,18 @@ $worker = {
         }
         if (-not $script:UpdateRestartPending -and $Selected -contains 'Office') { Update-OfficeLicense }
         if ($script:UpdateRestartPending) { Publish Reboot $autoRestart }
-        elseif ($Selected -contains 'Update') { Publish ResumeCleared $true }
         if ($script:WindowsFeatureRestartRequired -and -not $script:UpdateRestartPending) { Publish Reboot $false }
     } catch [OperationCanceledException] {
         if ($key -eq 'Drivers') { Publish DriverStatus 'ยกเลิกงานไดรเวอร์แล้ว' }
-        if ($key -eq 'Update' -and -not $script:UpdateRestartPending -and (Test-Path -LiteralPath $StatePath) -and
-            (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json).Mode -eq 'UpdateLoop') {
-            Clear-UpdateResume
-            Publish ResumeCleared $true
+        if ($key -eq 'Update') {
+            if ($script:UpdateRestartPending) {
+                Publish Reboot $false
+                Publish UpdateStatus 'รอรีสตาร์ท Windows บันทึกคิวไว้แล้ว'
+            } else {
+                Clear-UpdateResume
+                Publish ResumeCleared $true
+                Publish UpdateStatus 'ยกเลิกคิวอัปเดตแล้ว'
+            }
         }
         Write-Log $_.Exception.Message
         Publish Status 'ยกเลิกแล้ว'
@@ -1007,6 +1075,7 @@ $worker = {
         if ($key -eq 'Drivers' -and -not $script:DriverRestartRequired) {
             Publish DriverStatus 'งานไดรเวอร์ไม่สำเร็จทั้งหมด ดูรายละเอียดใน Log'
         }
+        if ($key -eq 'Update') { Publish UpdateStatus "อัปเดตหยุด: $($_.Exception.Message)" }
         Write-Log ("ผิดพลาดในงาน {0}: {1} (HRESULT {2:X8})" -f $key,$_.Exception.Message,$_.Exception.HResult)
         if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace }
         Publish Status 'หยุดเนื่องจากข้อผิดพลาด ดูรายละเอียดใน Log'
@@ -1023,15 +1092,19 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     $ui.Token = [Threading.CancellationTokenSource]::new()
     $ui.Space = [RunspaceFactory]::CreateRunspace()
     # Keep synchronous WUA COM calls on an MTA worker. WPF stays on the GUI thread.
-    $ui.Space.ApartmentState = if ('Update' -in $Selected -or 'Drivers' -in $Selected) { 'MTA' } else { 'STA' }
+    $ui.Space.ApartmentState = if ($Mode -in 'UpdateScan','DriverScan' -or 'Update' -in $Selected -or 'Drivers' -in $Selected) { 'MTA' } else { 'STA' }
     $ui.Space.ThreadOptions = 'ReuseThread'
     $ui.Space.Open()
     $ui.Work = [PowerShell]::Create()
     $ui.Work.Runspace = $ui.Space
+    $updatesForWork = if ($ui.Resume) { ,$resumeUpdates } else { ,$ui.UpdateList }
+    $processedForWork = if ($ui.Resume) { ,$resumeProcessedUpdateKeys } else { ,@() }
+    $failuresForWork = if ($ui.Resume) { ,$resumeUpdateFailures } else { ,@() }
     [void]$ui.Work.AddScript($worker.ToString())
     [void]$ui.Work.AddArgument($Root).AddArgument($Config).AddArgument($PayloadFolders).AddArgument($StatePath).
         AddArgument($ResumeTask).AddArgument($events).AddArgument($ui.Token.Token).AddArgument($Selected).
-        AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock)
+        AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock).
+        AddArgument($updatesForWork).AddArgument($processedForWork).AddArgument($failuresForWork)
     $ui.Handle = $ui.Work.BeginInvoke()
     $poll.Start()
 }
@@ -1048,12 +1121,35 @@ function Set-Busy([bool]$Busy) {
     $controls.ActivateMas.IsEnabled = $canChangeLicense
     $controls.OpenOfficeTool.IsEnabled = $canChangeLicense
     $controls.ScanDrivers.IsEnabled = -not $Busy -and -not $ui.Reboot -and -not $ui.Resume
+    $controls.ScanUpdates.IsEnabled = $controls.ScanDrivers.IsEnabled
+    $controls.InstallUpdates.IsEnabled = $controls.ScanUpdates.IsEnabled -and $ui.UpdateList.Count -gt 0
     $controls.Options.IsEnabled = -not $Busy -and -not $ui.Resume
     $controls.QuickActions.IsEnabled = $controls.Options.IsEnabled
 }
 function Set-WaitStatus([string]$Message) {
     if ($null -eq $ui.StatusBeforeWait) { $ui.StatusBeforeWait = $controls.Status.Text }
     $controls.Status.Text = $Message
+}
+function Show-UpdateRows {
+    $controls.AvailableUpdates.Text = (@(
+        foreach ($row in $ui.UpdateRows.Values) { "• $($row.Title) — $($row.Status)" }
+        foreach ($title in $ui.UpdateManualTitles) { "• $title — ต้องดำเนินการเอง" }
+    )) -join "`n"
+}
+function Show-UpdateTiming {
+    $text = 'สถานะล่าสุด {0:HH:mm:ss}' -f $ui.UpdateReportedAt
+    if ($ui.UpdateProgressClock) {
+        $seconds = [math]::Floor($ui.UpdateProgressClock.Elapsed.TotalSeconds)
+        if ($seconds -ge 1) { $text += " · รอข้อมูลเพิ่ม $seconds วินาที" }
+    }
+    if ($controls.UpdateTiming.Text -ne $text) { $controls.UpdateTiming.Text = $text }
+}
+function Set-UpdateSummary([string]$Message, [switch]$Waiting) {
+    $controls.UpdateSummary.Text = $Message
+    $controls.UpdateTiming.Visibility = 'Visible'
+    $ui.UpdateReportedAt = [datetime]::Now
+    $ui.UpdateProgressClock = if ($Waiting) { [Diagnostics.Stopwatch]::StartNew() }
+    Show-UpdateTiming
 }
 $poll = [Windows.Threading.DispatcherTimer]::new()
 $poll.Interval = [TimeSpan]::FromMilliseconds(150)
@@ -1146,9 +1242,66 @@ $poll.Add_Tick({
                     $ui.InstallerSkip = $eventItem.Value
                     $controls.SkipInstallerButton.IsEnabled = $null -ne $ui.InstallerSkip -and -not $ui.Token.IsCancellationRequested
                 }
-                ResumeCleared { if ($ui.Resume) { $ui.ResumeFinished = $true } }
+                UpdateList {
+                    $scan = $eventItem.Value
+                    $ui.UpdateList = $scan.Items
+                    foreach ($item in $ui.UpdateList) {
+                        $ui.UpdateRows[$item.Key] = @{ Title = $item.Title; Status = 'รอยืนยันติดตั้ง' }
+                    }
+                    $ui.UpdateManualTitles = $scan.ManualTitles
+                    Show-UpdateRows
+                    $summary = if ($ui.UpdateList.Count) { "พบ $($ui.UpdateList.Count) รายการ รอยืนยันติดตั้ง" } else { 'ไม่พบอัปเดตที่ติดตั้งอัตโนมัติได้' }
+                    if ($scan.ManualTitles.Count) { $summary += " · ต้องดำเนินการเอง $($scan.ManualTitles.Count) รายการ" }
+                    if ($scan.RebootRequired) { $summary += ' · Windows รอรีสตาร์ท' }
+                    Set-UpdateSummary $summary
+                    $controls.Status.Text = $controls.UpdateSummary.Text
+                }
+                UpdateStarted {
+                    $ui.UpdateList = @()
+                    $ui.UpdateRows.Clear()
+                    Show-UpdateRows
+                    Set-UpdateSummary 'กำลังเริ่มคิว Windows Update' -Waiting
+                }
+                UpdateQueued {
+                    foreach ($item in $eventItem.Value) {
+                        $ui.UpdateRows[$item.Key] = @{ Title = $item.Title; Status = 'รอดำเนินการ' }
+                    }
+                    Show-UpdateRows
+                }
+                UpdateItem {
+                    $item = $eventItem.Value
+                    $ui.UpdateRows[$item.Key] = $item
+                    $ui.ActiveUpdateKey = if ($item.Active) { $item.Key }
+                    Show-UpdateRows
+                    Set-UpdateSummary "$($item.Status) — $($item.Title)" -Waiting:$item.Active
+                }
+                UpdateActivity { Set-UpdateSummary $eventItem.Value -Waiting }
+                UpdateStatus {
+                    if ($ui.ActiveUpdateKey) {
+                        $ui.UpdateRows[$ui.ActiveUpdateKey].Status = 'หยุดระหว่างดำเนินการ (ดู Log)'
+                        $ui.ActiveUpdateKey = $null
+                        Show-UpdateRows
+                    }
+                    Set-UpdateSummary $eventItem.Value
+                }
+                UpdateComplete {
+                    $ui.UpdateManualTitles = $eventItem.Value.ManualTitles
+                    $summary = if ($ui.UpdateManualTitles.Count) {
+                        "ติดตั้งอัตโนมัติเสร็จ เหลือ $($ui.UpdateManualTitles.Count) รายการที่ต้องดำเนินการเอง"
+                    } else { 'ตรวจซ้ำแล้ว ไม่พบอัปเดตที่เหลือ' }
+                    Set-UpdateSummary $summary
+                    Show-UpdateRows
+                }
+                UpdateScanError {
+                    Set-UpdateSummary $eventItem.Value
+                    $controls.Status.Text = $eventItem.Value
+                }
+                ResumeCleared {
+                    $ui.Resume = $false
+                }
             }
         }
+        if ($ui.UpdateProgressClock) { Show-UpdateTiming }
         if ($ui.Handle -and -not $ui.Handle.IsCompleted -and
             ([DateTime]::UtcNow - $ui.LastLogAt).TotalSeconds -ge 15) {
             $line = '[{0:yyyy-MM-dd HH:mm:ss}] ยังรอผล | {1} | ผ่านไป {2:0} วินาที | ยังไม่มีข้อมูลความคืบหน้าเพิ่ม' -f
@@ -1173,6 +1326,7 @@ $poll.Add_Tick({
                     $controls.OfficeLicenseSummary.Text = 'ตรวจสถานะ Office ไม่สำเร็จ กดตรวจใหม่เพื่อลองอีกครั้ง'
                 }
                 else {
+                    if ($ui.UpdateProgressClock) { Set-UpdateSummary 'งาน Windows Update หยุด ดูรายละเอียดใน Log' }
                     $ui.StatusBeforeWait = $null
                     $controls.Status.Text = 'เกิดข้อผิดพลาดในงานเบื้องหลัง'
                     $controls.LogBox.AppendText($_.Exception.Message + [Environment]::NewLine)
@@ -1190,7 +1344,7 @@ $poll.Add_Tick({
             $controls.Progress.IsIndeterminate = $false
             $controls.ProgressLabel.Text = '{0:0}%' -f $controls.Progress.Value
             Set-Busy $false
-            if ($ui.Reboot -or $ui.ResumeFinished) {
+            if ($ui.Reboot) {
                 $controls.StartButton.IsEnabled = $false
                 $controls.Options.IsEnabled = $false
                 $controls.QuickActions.IsEnabled = $false
@@ -1279,6 +1433,17 @@ $controls.ScanDrivers.Add_Click({
     Set-Busy $true
     Start-Work 'DriverScan' @()
 })
+$controls.ScanUpdates.Add_Click({
+    if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
+    $ui.UpdateList = @()
+    $ui.UpdateRows.Clear()
+    $ui.UpdateManualTitles = @()
+    Show-UpdateRows
+    Set-UpdateSummary 'กำลังตรวจ Windows Update…' -Waiting
+    $controls.Status.Text = $controls.UpdateSummary.Text
+    Set-Busy $true
+    Start-Work 'UpdateScan' @()
+})
 
 function Show-PartitionDialog {
     [xml]$partitionXaml = @"
@@ -1325,6 +1490,10 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
     $programs = @(Get-InstalledProgramRecords)
     $plan = @(foreach ($key in $Selected) {
         $choices[$key][0]
+        if ($key -eq 'Update') {
+            foreach ($update in $ui.UpdateList) { "  • $($update.Title)" }
+            '  • เมื่อจบรอบแรก จะตรวจและติดตั้งรอบถัดไปจนไม่เหลืออัปเดตที่ติดตั้งอัตโนมัติได้'
+        }
         if ($key -eq 'Disk') { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
         if ($key -eq 'SMB1') { '  • SMB 1.0 เป็นโปรโตคอลเก่า ควรเปิดเมื่อจำเป็นสำหรับอุปกรณ์รุ่นเก่า' }
         if ($key -in 'Apps','Runtimes','LINE','Office','Foxit','ACDSee') {
@@ -1392,21 +1561,27 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
     return $dialog.ShowDialog() -eq $true
 }
 
-function Start-SelectedSetup([switch]$OfficeOnly) {
-    if ($ui.Handle -or $ui.Reboot -or $ui.ResumeFinished) { return }
+function Start-SelectedSetup([switch]$OfficeOnly, [switch]$UpdateOnly) {
+    if ($ui.Handle -or $ui.Reboot) { return }
     Update-PayloadTaskVisibility
-    $selected = @(if ($ui.Resume) { 'Update' }
+    $selected = @(if ($ui.Resume -or $UpdateOnly) { 'Update' }
         elseif ($OfficeOnly) { 'Office' } else { $choices.Keys | Where-Object { $checks[$_].IsChecked } })
     $hidden = @($selected | Where-Object { $checks[$_].Visibility -ne 'Visible' })
     $selected = @($selected | Where-Object { $checks[$_].Visibility -eq 'Visible' })
     if (-not $selected) { $controls.Status.Text = 'เลือกอย่างน้อยหนึ่งรายการ'; return }
+    if ('Update' -in $selected -and -not $ui.Resume -and -not $ui.UpdateList.Count) {
+        Show-DetailsDrawer $controls.DriversNav
+        $controls.Status.Text = 'กดตรวจอัปเดตก่อนเลือกติดตั้ง'
+        return
+    }
     $dataPercent = 0
     if ($selected -contains 'Disk') {
         $dataPercent = Show-PartitionDialog
         if ($null -eq $dataPercent) { return }
     }
     if (-not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
-    if (-not $OfficeOnly) { Show-DetailsDrawer $controls.LogNav }
+    if ($selected.Count -eq 1 -and $selected[0] -eq 'Update') { Show-DetailsDrawer $controls.DriversNav }
+    elseif (-not $OfficeOnly) { Show-DetailsDrawer $controls.LogNav }
     $controls.Progress.Value = 0
     $controls.ProgressLabel.Text = '0%'
     $controls.Status.Text = 'กำลังเริ่มงาน'
@@ -1414,6 +1589,7 @@ function Start-SelectedSetup([switch]$OfficeOnly) {
     Start-Work 'Setup' $selected $dataPercent
 }
 $controls.StartButton.Add_Click({ Start-SelectedSetup })
+$controls.InstallUpdates.Add_Click({ Start-SelectedSetup -UpdateOnly })
 $controls.InstallOffice.Add_Click({
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume -or -not $ui.OfficeLicense.CanInstall) { return }
     Start-SelectedSetup -OfficeOnly
