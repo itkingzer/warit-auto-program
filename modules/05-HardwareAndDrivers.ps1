@@ -25,9 +25,7 @@ function Invoke-DriverCheck([switch]$Install) {
     Publish DriverDevices @($missing | ForEach-Object { if ($_.Name) { $_.Name } else { $_.PNPDeviceID } })
     Write-Log 'กำลังค้นหาไดรเวอร์ผ่านแหล่ง Windows Update ของเครื่อง'
     $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $result = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Driver'")
-    if ($result.ResultCode -ne 2) { throw "ค้นหาไดรเวอร์ไม่สำเร็จ (ResultCode $($result.ResultCode))" }
+    $result = Search-SetupUpdates $session -Online -DriversOnly
     Assert-Running
     $candidates = @(foreach ($update in $result.Updates) {
         $eligible = -not $update.InstallationBehavior.CanRequestUserInput -and
@@ -56,7 +54,7 @@ function Invoke-DriverCheck([switch]$Install) {
             $downloader = $session.CreateUpdateDownloader()
             $downloader.Updates = $collection
             Write-Log "ดาวน์โหลด $($update.Title)"
-            $download = $downloader.Download()
+            $download = Invoke-UpdateDownload $downloader $collection
             if ($download.ResultCode -ne 2) { throw ('ดาวน์โหลดไม่สำเร็จ: HRESULT {0:X8}' -f $download.GetUpdateResult(0).HResult) }
             Assert-Running
             $installer = $session.CreateUpdateInstaller()
@@ -64,7 +62,7 @@ function Invoke-DriverCheck([switch]$Install) {
             $installer.AllowSourcePrompts = $false
             $installer.ForceQuiet = $true
             if ($installer.RebootRequiredBeforeInstallation) { $script:DriverRestartRequired = $true; break }
-            $installResult = $installer.Install()
+            $installResult = Invoke-UpdateInstall $installer "กำลังติดตั้ง $($update.Title)"
             if ($installResult.RebootRequired) { $script:DriverRestartRequired = $true }
             $item = $installResult.GetUpdateResult(0)
             if ($item.ResultCode -ne 2) { throw ('ติดตั้งไม่สำเร็จ: HRESULT {0:X8}' -f $item.HResult) }

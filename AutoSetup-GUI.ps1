@@ -29,7 +29,11 @@ if (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -
     try { exit $child.ExitCode } finally { $child.Dispose() }
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-$windowTitle = 'Warit · Windows Auto Setup'
+$versionPath = Join-Path $Root 'version.txt'
+$BuildVersion = if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
+    (Get-Content -LiteralPath $versionPath -Raw).Trim()
+} else { 'source' }
+$windowTitle = "Warit · Windows Auto Setup ($BuildVersion)"
 $mutex = [Threading.Mutex]::new($false, 'Global\WaritAutoSetup')
 try { $locked = $mutex.WaitOne(2000) } catch [Threading.AbandonedMutexException] { $locked = $true }
 if (-not $locked) {
@@ -589,6 +593,8 @@ $choices = [ordered]@{
               <TabItem Header="บันทึกการทำงาน">
                 <DockPanel>
                   <Button Name="LogsButton" DockPanel.Dock="Top" HorizontalAlignment="Left" Margin="0,0,0,8" Content="เปิดโฟลเดอร์ Log"/>
+                  <Button Name="RetryAppsButton" DockPanel.Dock="Bottom" HorizontalAlignment="Left" Margin="0,8,0,0"
+                          Style="{StaticResource QuietButton}" Content="ลองติดตั้งโปรแกรมที่ล้มเหลวอีกครั้ง" Visibility="Collapsed"/>
                   <Button Name="SkipInstallerButton" DockPanel.Dock="Bottom" HorizontalAlignment="Left" Margin="0,8,0,0"
                           Padding="8,3" FontSize="12" Content="ข้ามตัวติดตั้ง" IsEnabled="False"/>
                   <Border CornerRadius="8" Background="{DynamicResource ConsoleBrush}" Padding="8">
@@ -635,6 +641,7 @@ $taskbarResult = [WaritAutoSetup.Taskbar]::SetCurrentProcessExplicitAppUserModel
 if ($taskbarResult -lt 0) { [Runtime.InteropServices.Marshal]::ThrowExceptionForHR($taskbarResult) }
 
 $Window = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xaml))
+$Window.Title = $windowTitle
 $brandAssets = Join-Path $Root 'assets'
 $Window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([uri](Join-Path $brandAssets 'app.ico'))
 $Window.FindName('AppLogo').ImageSource = [Windows.Media.Imaging.BitmapFrame]::Create([uri](Join-Path $brandAssets 'app-logo.png'))
@@ -645,6 +652,7 @@ foreach ($name in 'StartButton','CancelButton','RestartButton','LogsButton','Opt
 $controls.CheckPayload = $Window.FindName('CheckPayload')
 $controls.PayloadReportPane = $Window.FindName('PayloadReportPane')
 $controls.SkipInstallerButton = $Window.FindName('SkipInstallerButton')
+$controls.RetryAppsButton = $Window.FindName('RetryAppsButton')
 foreach ($name in 'ScanUpdates','InstallUpdates','UpdateSummary','UpdateTiming','AvailableUpdates') { $controls[$name] = $Window.FindName($name) }
 $controls.PayloadReport = $Window.FindName('PayloadReport')
 $controls.OpenOfficeInstaller = $Window.FindName('OpenOfficeInstaller')
@@ -838,7 +846,7 @@ Update-PayloadTaskVisibility
 $events = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 # ส่งสถานะผ่านคิว กิจกรรมที่ใช้เวลานานอยู่ใน Runspace นี้ทั้งหมด
 $worker = {
-    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures)
+    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures, $BuildVersion, $ChangeSmbSigning, $RetryApps)
     $ErrorActionPreference = 'Stop'
     function Publish($Kind, $Value) { $Events.Enqueue(@{ Kind = $Kind; Value = $Value }) }
     function Write-Log([string]$Message) {
@@ -1023,6 +1031,7 @@ $worker = {
         return
     }
     if ($WorkerMode -eq 'DriverScan') {
+        . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
         . (Join-Path $Root 'modules\05-HardwareAndDrivers.ps1')
         try {
             Invoke-DriverCheck
@@ -1036,14 +1045,17 @@ $worker = {
         }
         return
     }
+    $appFailures = [ordered]@{}
     try {
         foreach ($module in '01-DiskAndData','02-SystemTweaks','03-InstallAllAndFix','04-WindowsUpdateLoop','05-HardwareAndDrivers') {
             . (Join-Path $Root "modules\$module.ps1")
         }
         $completed = 0
         $queueTimer = [Diagnostics.Stopwatch]::StartNew()
+        Write-Log "รุ่น $BuildVersion"
         Write-Log "เริ่มคิว $($Selected.Count) งาน | $($Selected -join ' → ')"
         $printerIncomplete = $false
+        $printerNeedsTest = $false
         $unavailableCount = 0
         $updateResult = $null
         foreach ($key in $Selected) {
@@ -1062,7 +1074,10 @@ $worker = {
                 Disk { Invoke-DiskAndData -DataPercent $DataPercent }
                 System { Invoke-SystemTweaks }
                 GraveAccent { Enable-GraveAccentLanguageSwitch }
-                Printer { $printerIncomplete = -not (Invoke-PrinterFix) }
+                Printer {
+                    $printerIncomplete = -not (Invoke-PrinterFix -ChangeSmbSigning:$ChangeSmbSigning)
+                    $printerNeedsTest = -not $printerIncomplete
+                }
                 Fonts { Install-LocalFonts }
                 Drivers { Invoke-DriverCheck -Install }
                 Update {
@@ -1075,7 +1090,7 @@ $worker = {
                     }
                 }
                 default {
-                    Invoke-PayloadGroup $key -SkipMissing -UnavailableCount ([ref]$unavailableCount)
+                    Invoke-PayloadGroup $key -SkipMissing -UnavailableCount ([ref]$unavailableCount) -AppFailures $appFailures -RetryApps $RetryApps
                 }
             }
             $completed++
@@ -1085,7 +1100,7 @@ $worker = {
         }
         Assert-Running
         $autoRestart = $script:UpdateRestartPending -and -not $script:UpdateAutoRestartBlocked -and
-            $completed -eq $Selected.Count -and -not $printerIncomplete
+            $completed -eq $Selected.Count -and -not $printerIncomplete -and -not $appFailures.Count
         $message = if ($autoRestart) { 'งานที่เลือกเสร็จแล้ว กำลังรีสตาร์ทเพื่อทำ Windows Update ต่อ' }
             elseif ($script:UpdateRestartPending) { 'กดรีสตาร์ทเครื่องและยืนยัน เพื่อทำ Windows Update ต่อ' }
             elseif ($script:DriverRestartRequired) { 'ต้องรีสตาร์ทเครื่องก่อนทำงานที่เหลือ' }
@@ -1100,6 +1115,8 @@ $worker = {
                 else { 'ตรวจซ้ำแล้ว ไม่พบอัปเดตที่เหลือ' }
             }
             else { 'เสร็จสิ้น' }
+        if ($appFailures.Count) { $message += " · โปรแกรมล้มเหลว $($appFailures.Count) รายการ ดู Log หรือลองใหม่" }
+        if ($printerNeedsTest) { $message += ' · Printer 709 รอทดสอบพิมพ์จริง' }
         Write-Log ("{0} | ผ่านคิว {1}/{2} งาน | ข้าม {3} รายการ | เวลารวม {4:0.0} วินาที" -f $message,$completed,$Selected.Count,$unavailableCount,$queueTimer.Elapsed.TotalSeconds)
         Publish Status $message
         if (-not $script:UpdateRestartPending -and ($Selected | Where-Object { $_ -in 'Apps','Runtimes','Foxit','ACDSee','LINE','Office' })) {
@@ -1107,7 +1124,7 @@ $worker = {
         }
         if (-not $script:UpdateRestartPending -and $Selected -contains 'Office') { Update-OfficeLicense }
         if ($script:UpdateRestartPending) { Publish Reboot $autoRestart }
-        if ($script:WindowsFeatureRestartRequired -and -not $script:UpdateRestartPending) { Publish Reboot $false }
+        if (($script:WindowsFeatureRestartRequired -or $script:DriverRestartRequired) -and -not $script:UpdateRestartPending) { Publish Reboot $false }
     } catch [OperationCanceledException] {
         if ($key -eq 'Drivers') { Publish DriverStatus 'ยกเลิกงานไดรเวอร์แล้ว' }
         if ($key -eq 'Update') {
@@ -1127,13 +1144,16 @@ $worker = {
             Publish DriverStatus 'งานไดรเวอร์ไม่สำเร็จทั้งหมด ดูรายละเอียดใน Log'
         }
         if ($key -eq 'Update') { Publish UpdateStatus "อัปเดตหยุด: $($_.Exception.Message)" }
+        if ($script:DriverRestartRequired -or $script:UpdateRestartPending) { Publish Reboot $false }
         Write-Log ("ผิดพลาดในงาน {0}: {1} (HRESULT {2:X8})" -f $key,$_.Exception.Message,$_.Exception.HResult)
         if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace }
         Publish Status 'หยุดเนื่องจากข้อผิดพลาด ดูรายละเอียดใน Log'
+    } finally {
+        if ($Selected -contains 'Apps') { Publish AppFailures @($appFailures.Keys) }
     }
 }
 
-function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
+function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0, [bool]$ChangeSmbSigning = $false, [string[]]$RetryApps) {
     $log = Join-Path $logDir ((Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff') + "_$Mode.log")
     $ui.Mode = $Mode
     $ui.LogPath = $log
@@ -1142,7 +1162,7 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     $ui.StageTimer = [Diagnostics.Stopwatch]::StartNew()
     $ui.Token = [Threading.CancellationTokenSource]::new()
     $ui.Space = [RunspaceFactory]::CreateRunspace()
-    # Keep synchronous WUA COM calls on an MTA worker. WPF stays on the GUI thread.
+    # WUA jobs run on an MTA worker. WPF stays on the GUI thread.
     $ui.Space.ApartmentState = if ($Mode -in 'UpdateScan','DriverScan' -or 'Update' -in $Selected -or 'Drivers' -in $Selected) { 'MTA' } else { 'STA' }
     $ui.Space.ThreadOptions = 'ReuseThread'
     $ui.Space.Open()
@@ -1155,11 +1175,13 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     [void]$ui.Work.AddArgument($Root).AddArgument($Config).AddArgument($PayloadFolders).AddArgument($StatePath).
         AddArgument($ResumeTask).AddArgument($events).AddArgument($ui.Token.Token).AddArgument($Selected).
         AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock).
-        AddArgument($updatesForWork).AddArgument($processedForWork).AddArgument($failuresForWork)
+        AddArgument($updatesForWork).AddArgument($processedForWork).AddArgument($failuresForWork).
+        AddArgument($BuildVersion).AddArgument($ChangeSmbSigning).AddArgument($RetryApps)
     $ui.Handle = $ui.Work.BeginInvoke()
     $poll.Start()
 }
 function Set-Busy([bool]$Busy) {
+    $controls.RetryAppsButton.IsEnabled = -not $Busy -and -not $ui.Reboot -and -not $ui.Resume
     if ($Busy) { $controls.StartButton.IsEnabled = $false } else { Update-SelectionSummary }
     $controls.RestartButton.IsEnabled = -not $Busy
     $controls.CancelButton.IsEnabled = $Busy
@@ -1237,6 +1259,11 @@ $poll.Add_Tick({
                     $controls.Progress.IsIndeterminate = $false
                     $controls.Progress.Value = [double]$eventItem.Value
                     $controls.ProgressLabel.Text = '{0:0}%' -f $controls.Progress.Value
+                }
+                AppFailures {
+                    $ui.FailedApps = @($eventItem.Value | Where-Object { $_ })
+                    $controls.RetryAppsButton.Visibility = if ($ui.FailedApps.Count) { 'Visible' } else { 'Collapsed' }
+                    $controls.RetryAppsButton.ToolTip = $ui.FailedApps -join [Environment]::NewLine
                 }
                 Status {
                     $ui.StatusBeforeWait = $null
@@ -1551,7 +1578,11 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
             foreach ($update in $ui.UpdateList) { "  • $($update.Title)" }
             '  • เมื่อจบรอบแรก จะตรวจและติดตั้งรอบถัดไปจนไม่เหลืออัปเดตที่ติดตั้งอัตโนมัติได้'
         }
-        if ($key -eq 'Disk') { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
+        if ($key -eq 'Disk') {
+            if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'WaritAutoSetup\data-partition.json') -PathType Leaf) {
+                '  • ทำแผน Data ที่ค้างไว้ต่อ โดยใช้ขนาดที่บันทึกไว้'
+            } else { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
+        }
         if ($key -eq 'SMB1') { '  • SMB 1.0 เป็นโปรโตคอลเก่า ควรเปิดเมื่อจำเป็นสำหรับอุปกรณ์รุ่นเก่า' }
         if ($key -in 'Apps','Runtimes','LINE','Office','Foxit','ACDSee') {
             $entries = @($Config.Packages.$key | Where-Object { $_ })
@@ -1567,7 +1598,7 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
                         $folder = Get-PayloadEntryFolder $key $entry
                         switch (Get-PackagePayloadStatus $key $entry $folder) {
                             'ขาดตัวติดตั้ง' { 'ข้าม: ขาดตัวติดตั้ง' }
-                            'พบไฟล์หลายตัว' { 'พบไฟล์หลายตัว งานอาจหยุดเมื่อถึงรายการนี้' }
+                            'พบไฟล์หลายตัว' { 'พบไฟล์หลายตัว ต้องเลือกให้เหลือไฟล์เดียว' }
                             default { $_ }
                         }
                     }
@@ -1633,19 +1664,36 @@ function Start-SelectedSetup([switch]$OfficeOnly, [switch]$UpdateOnly) {
     }
     $dataPercent = 0
     if ($selected -contains 'Disk') {
-        $dataPercent = Show-PartitionDialog
+        $dataPlan = Join-Path $env:ProgramData 'WaritAutoSetup\data-partition.json'
+        $dataPercent = if (Test-Path -LiteralPath $dataPlan -PathType Leaf) { 50 } else { Show-PartitionDialog }
         if ($null -eq $dataPercent) { return }
     }
     if (-not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
+    $changeSmbSigning = $false
+    if ($selected -contains 'Printer') {
+        $answer = [Windows.MessageBox]::Show($Window,
+            "ปิดการบังคับ SMB signing สำหรับการเชื่อมต่อขาออกทั้งเครื่องด้วยหรือไม่?`nใช่ = เปลี่ยนค่า · ไม่ = ทำเฉพาะ GPEDIT/RPC · ยกเลิก = กลับไปหน้าหลัก",
+            'Printer Error 709', 'YesNoCancel', 'Warning', 'No')
+        if ($answer -eq 'Cancel') { return }
+        $changeSmbSigning = $answer -eq 'Yes'
+    }
     if ($selected.Count -eq 1 -and $selected[0] -eq 'Update') { Show-DetailsDrawer $controls.DriversNav }
     elseif (-not $OfficeOnly) { Show-DetailsDrawer $controls.LogNav }
     $controls.Progress.Value = 0
     $controls.ProgressLabel.Text = '0%'
     $controls.Status.Text = 'กำลังเริ่มงาน'
     Set-Busy $true
-    Start-Work 'Setup' $selected $dataPercent
+    Start-Work 'Setup' $selected $dataPercent $changeSmbSigning
 }
 $controls.StartButton.Add_Click({ Start-SelectedSetup })
+$controls.RetryAppsButton.Add_Click({
+    if ($ui.Handle -or $ui.Reboot -or $ui.Resume -or -not $ui.FailedApps.Count) { return }
+    $controls.Progress.Value = 0
+    $controls.ProgressLabel.Text = '0%'
+    $controls.Status.Text = 'กำลังลองติดตั้งโปรแกรมที่ล้มเหลวอีกครั้ง'
+    Set-Busy $true
+    Start-Work 'Setup' @('Apps') -RetryApps $ui.FailedApps
+})
 $controls.InstallUpdates.Add_Click({ Start-SelectedSetup -UpdateOnly })
 $controls.InstallOffice.Add_Click({
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume -or -not $ui.OfficeLicense.CanInstall) { return }

@@ -92,7 +92,8 @@ function Invoke-UpdateDownload($Downloader, $Updates, $UpdateItem) {
         $percentages[$i] = 0
         Write-Log "ดาวน์โหลด 0% — $($Updates.Item($i).Title)"
     }
-    $job = $Downloader.BeginDownload($callback, $callback, $null)
+    $job = $Downloader.BeginDownload($callback, $callback, '')
+    if ($null -eq $job) { throw 'Windows Update ไม่คืนงานดาวน์โหลด' }
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $idle = [Diagnostics.Stopwatch]::StartNew()
     $lastBytes = $null
@@ -100,7 +101,9 @@ function Invoke-UpdateDownload($Downloader, $Updates, $UpdateItem) {
         while (-not $job.IsCompleted) {
             Assert-Running
             if ($timer.Elapsed.TotalSeconds -ge 2700) { throw "Windows Update หมดเวลารอดาวน์โหลด (45 นาที)" }
+            if ($idle.Elapsed.TotalSeconds -ge 600) { throw 'ดาวน์โหลด Windows Update ไม่มีความคืบหน้า 10 นาที' }
             $progress = $job.GetProgress()
+            if ($null -eq $progress) { Start-Sleep -Milliseconds 500; continue }
             $bytes = $progress.TotalBytesDownloaded
             if ($bytes -ne $lastBytes) {
                 $lastBytes = $bytes
@@ -112,12 +115,12 @@ function Invoke-UpdateDownload($Downloader, $Updates, $UpdateItem) {
                 $percentages[$index] = $percent
                 $idle.Restart()
                 Write-Log "ดาวน์โหลด $percent% — $($Updates.Item($index).Title)"
-                Publish-UpdateItem $UpdateItem "กำลังดาวน์โหลด $percent%" -Active
+                if ($UpdateItem) { Publish-UpdateItem $UpdateItem "กำลังดาวน์โหลด $percent%" -Active }
             }
-            if ($idle.Elapsed.TotalSeconds -ge 600) { throw 'ดาวน์โหลด Windows Update ไม่มีความคืบหน้า 10 นาที' }
             Start-Sleep -Milliseconds 500
         }
         $result = $Downloader.EndDownload($job)
+        if ($null -eq $result) { throw 'Windows Update ไม่คืนผลดาวน์โหลด' }
         for ($i = 0; $i -lt $Updates.Count; $i++) {
             $item = $result.GetUpdateResult($i)
             if ($item.ResultCode -eq 2) {
@@ -130,6 +133,18 @@ function Invoke-UpdateDownload($Downloader, $Updates, $UpdateItem) {
     }
 }
 
+function Invoke-UpdateInstall($Installer, [string]$Phase, $UpdateItem) {
+    $callback = New-UpdateCallback
+    $job = $Installer.BeginInstall($callback, $callback, '')
+    if ($null -eq $job) { throw 'Windows Update ไม่คืนงานติดตั้ง' }
+    try {
+        Wait-UpdateJob $job $Phase 5400 $UpdateItem
+        $result = $Installer.EndInstall($job)
+        if ($null -eq $result) { throw 'Windows Update ไม่คืนผลติดตั้ง' }
+        return $result
+    } finally { Close-UpdateJob $job }
+}
+
 function Wait-UpdateJob($Job, [string]$Phase, [int]$TimeoutSeconds, $UpdateItem) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastPercent = -1
@@ -137,7 +152,9 @@ function Wait-UpdateJob($Job, [string]$Phase, [int]$TimeoutSeconds, $UpdateItem)
         Assert-Running
         if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Windows Update หมดเวลารอ $Phase ($TimeoutSeconds วินาที)" }
         if ($UpdateItem) {
-            $percent = $Job.GetProgress().PercentComplete
+            $progress = $Job.GetProgress()
+            if ($null -eq $progress) { Start-Sleep -Milliseconds 500; continue }
+            $percent = $progress.PercentComplete
             if ($percent -ne $lastPercent) {
                 $lastPercent = $percent
                 Write-Log "$Phase | $percent%"
@@ -149,6 +166,7 @@ function Wait-UpdateJob($Job, [string]$Phase, [int]$TimeoutSeconds, $UpdateItem)
 }
 
 function Close-UpdateJob($Job) {
+    if ($null -eq $Job) { return }
     try {
         if ($Job.IsCompleted) { $Job.CleanUp(); return }
         $Job.RequestAbort()
@@ -161,16 +179,18 @@ function Close-UpdateJob($Job) {
     }
 }
 
-function Search-SetupUpdates($Session, [switch]$Online) {
+function Search-SetupUpdates($Session, [switch]$Online, [switch]$DriversOnly) {
     $searcher = $Session.CreateUpdateSearcher()
     $searcher.Online = [bool]$Online
     $callback = New-UpdateCallback
     $criteria = '(IsInstalled=0 and IsHidden=0 and BrowseOnly=0) or (IsInstalled=0 and IsHidden=0 and BrowseOnly=1)'
+    if ($DriversOnly) { $criteria = "IsInstalled=0 and IsHidden=0 and Type='Driver'" }
     $phase = if ($Online) { 'ค้นหาออนไลน์' } else { 'ตรวจรายการที่บันทึกกับแคช Windows Update' }
     Write-Log "Windows Update: $phase"
     Publish UpdateActivity "กำลัง$phase"
     Assert-Running
-    $job = $searcher.BeginSearch($criteria, $callback, $null)
+    $job = $searcher.BeginSearch($criteria, $callback, '')
+    if ($null -eq $job) { throw 'Windows Update ไม่คืนงานค้นหา' }
     try {
         Wait-UpdateJob $job $phase 600
         $result = $searcher.EndSearch($job)
@@ -250,53 +270,64 @@ function Invoke-WindowsUpdateBatch([object[]]$UpdateList, [hashtable]$Processed)
             Publish-UpdateItem $item 'ข้ามรายการ (ดู Log)'
             continue
         }
-        $updates = New-Object -ComObject Microsoft.Update.UpdateColl
-        [void]$updates.Add($update)
-        if (-not $update.EulaAccepted) { $update.AcceptEula() }
-        if ($update.IsDownloaded) { Write-Log "ดาวน์โหลด 100% — $($item.Title) (มีไฟล์แล้ว)" }
-        else {
-            Publish-UpdateItem $item 'กำลังดาวน์โหลด' -Active
-            $download = $session.CreateUpdateDownloader()
-            $download.Updates = $updates
-            $downloadResult = Invoke-UpdateDownload $download $updates $item
-            $downloadItem = $downloadResult.GetUpdateResult(0)
-            if ($downloadItem.ResultCode -ne 2) {
-                $failure = 'ดาวน์โหลด {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f
-                    $item.Title,$downloadItem.ResultCode,$downloadItem.HResult
-                $Processed[$item.Key] = $failure
-                Write-Log $failure
-                Publish-UpdateItem $item ('ดาวน์โหลดไม่สำเร็จ (0x{0:X8})' -f $downloadItem.HResult)
-                continue
+        $restartBefore = $false
+        $needsRestart = $false
+        try {
+            $updates = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$updates.Add($update)
+            if (-not $update.EulaAccepted) { $update.AcceptEula() }
+            if ($update.IsDownloaded) { Write-Log "ดาวน์โหลด 100% — $($item.Title) (มีไฟล์แล้ว)" }
+            else {
+                Publish-UpdateItem $item 'กำลังดาวน์โหลด' -Active
+                $download = $session.CreateUpdateDownloader()
+                $download.Updates = $updates
+                $downloadResult = Invoke-UpdateDownload $download $updates $item
+                $downloadItem = $downloadResult.GetUpdateResult(0)
+                if ($downloadItem.ResultCode -ne 2) {
+                    $failure = 'ดาวน์โหลด {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f
+                        $item.Title,$downloadItem.ResultCode,$downloadItem.HResult
+                    $Processed[$item.Key] = $failure
+                    Write-Log $failure
+                    Publish-UpdateItem $item ('ดาวน์โหลดไม่สำเร็จ (0x{0:X8})' -f $downloadItem.HResult)
+                    continue
+                }
             }
+            Assert-Running
+            $installer = $session.CreateUpdateInstaller()
+            $installer.Updates = $updates
+            $installer.AllowSourcePrompts = $false
+            $installer.ForceQuiet = $true
+            if ($installer.RebootRequiredBeforeInstallation) {
+                $restartBefore = $true
+            } else {
+                Write-Log "กำลังติดตั้ง $($item.Title)"
+                Publish-UpdateItem $item 'กำลังติดตั้ง' -Active
+                $result = Invoke-UpdateInstall $installer "กำลังติดตั้ง $itemStatus" $item
+                $installed = $result.GetUpdateResult(0)
+                Write-Log ('{0} | ResultCode {1} | HRESULT {2:X8} | รีสตาร์ท {3}' -f $item.Title,$installed.ResultCode,$installed.HResult,$result.RebootRequired)
+                $Processed[$item.Key] = if ($installed.ResultCode -eq 2) { $true } else {
+                    'ติดตั้ง {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f $item.Title,$installed.ResultCode,$installed.HResult
+                }
+                $needsRestart = $result.RebootRequired -or $installed.RebootRequired
+                $itemResult = if ($installed.ResultCode -ne 2) { 'ติดตั้งไม่สำเร็จ (0x{0:X8})' -f $installed.HResult }
+                    elseif ($needsRestart) { 'ติดตั้งแล้ว รอรีสตาร์ต' }
+                    else { 'ติดตั้งเสร็จแล้ว' }
+                Publish-UpdateItem $item $itemResult
+            }
+        } catch [OperationCanceledException] {
+            throw
+        } catch {
+            $failure = '{0} | {1} | HRESULT {2:X8}' -f $item.Title,$_.Exception.Message,$_.Exception.HResult
+            $Processed[$item.Key] = $failure
+            Write-Log $failure
+            if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace }
+            Publish-UpdateItem $item 'ดำเนินการไม่สำเร็จ (ดู Log)'
         }
-        Assert-Running
-        $installer = $session.CreateUpdateInstaller()
-        $installer.Updates = $updates
-        $installer.AllowSourcePrompts = $false
-        $installer.ForceQuiet = $true
-        if ($installer.RebootRequiredBeforeInstallation) {
+        if ($restartBefore) {
             Publish-UpdateItem $item 'รอรีสตาร์ตก่อนติดตั้ง'
             Save-UpdateRestart @($UpdateList | Select-Object -Skip $i) $Processed "ต้องรีสตาร์ทก่อนติดตั้ง $($item.Title)"
             return
         }
-        Write-Log "กำลังติดตั้ง $($item.Title)"
-        Publish-UpdateItem $item 'กำลังติดตั้ง' -Active
-        $callback = New-UpdateCallback
-        $job = $installer.BeginInstall($callback, $callback, $null)
-        try {
-            Wait-UpdateJob $job "กำลังติดตั้ง $itemStatus" 5400 $item
-            $result = $installer.EndInstall($job)
-        } finally { Close-UpdateJob $job }
-        $installed = $result.GetUpdateResult(0)
-        Write-Log ('{0} | ResultCode {1} | HRESULT {2:X8} | รีสตาร์ท {3}' -f $item.Title,$installed.ResultCode,$installed.HResult,$result.RebootRequired)
-        $Processed[$item.Key] = if ($installed.ResultCode -eq 2) { $true } else {
-            'ติดตั้ง {0} ไม่สำเร็จ | ResultCode {1} | HRESULT {2:X8}' -f $item.Title,$installed.ResultCode,$installed.HResult
-        }
-        $needsRestart = $result.RebootRequired -or $installed.RebootRequired
-        $itemResult = if ($installed.ResultCode -ne 2) { 'ติดตั้งไม่สำเร็จ (0x{0:X8})' -f $installed.HResult }
-            elseif ($needsRestart) { 'ติดตั้งแล้ว รอรีสตาร์ต' }
-            else { 'ติดตั้งเสร็จแล้ว' }
-        Publish-UpdateItem $item $itemResult
         if ($needsRestart) {
             Save-UpdateRestart @($UpdateList | Select-Object -Skip ($i + 1)) $Processed "ผลการติดตั้ง $($item.Title) แจ้งว่าต้องรีสตาร์ท"
             return

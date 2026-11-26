@@ -92,9 +92,7 @@
                                       "Name":  "Adobe Photoshop CS6 Extended",
                                       "DetectName":  "^Adobe Photoshop CS6(?:\\s|$)",
                                       "File":  "Adobe Photoshop CS6 Extended 13.1.2.exe",
-                                      "AutorunSkipExitCodes":  [5],
                                       "Arguments":  "-y -gm2",
-                                      "Reinstall":  true,
                                       "Enabled":  true
                                   },
                                   {
@@ -174,7 +172,7 @@
                                       "DetectName":  "^Adobe AIR(?:\\s|$)",
                                       "File":  "winstall-HARMAN_AdobeAIR.exe",
                                       "Arguments":  "",
-                                      "Enabled":  true
+                                      "Enabled":  false
                                   },
                                   {
                                       "Name":  "AnyDesk",
