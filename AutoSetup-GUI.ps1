@@ -566,6 +566,8 @@ $choices = [ordered]@{
               <TabItem Header="บันทึกการทำงาน">
                 <DockPanel>
                   <Button Name="LogsButton" DockPanel.Dock="Top" HorizontalAlignment="Left" Margin="0,0,0,8" Content="เปิดโฟลเดอร์ Log"/>
+                  <Button Name="SkipInstallerButton" DockPanel.Dock="Bottom" HorizontalAlignment="Left" Margin="0,8,0,0"
+                          Padding="8,3" FontSize="12" Content="ข้ามตัวติดตั้ง" IsEnabled="False"/>
                   <Border CornerRadius="8" Background="{DynamicResource ConsoleBrush}" Padding="8">
                     <TextBox Name="LogBox" BorderThickness="0" Background="Transparent" Foreground="{DynamicResource ConsoleTextBrush}"
                              AutomationProperties.Name="บันทึกการทำงาน" FontFamily="Consolas, Segoe UI" FontSize="13" Padding="5"
@@ -619,6 +621,7 @@ foreach ($name in 'StartButton','CancelButton','RestartButton','LogsButton','Opt
 }
 $controls.CheckPayload = $Window.FindName('CheckPayload')
 $controls.PayloadReportPane = $Window.FindName('PayloadReportPane')
+$controls.SkipInstallerButton = $Window.FindName('SkipInstallerButton')
 $controls.PayloadReport = $Window.FindName('PayloadReport')
 $controls.OpenOfficeInstaller = $Window.FindName('OpenOfficeInstaller')
 $controls.OpenOfficeTool = $Window.FindName('OpenOfficeTool')
@@ -811,7 +814,7 @@ $worker = {
     function Assert-Running {
         if ($Cancel.IsCancellationRequested) { throw [OperationCanceledException]::new('ยกเลิกตามคำสั่งผู้ใช้') }
     }
-    function Invoke-Program([string]$File, [string]$Arguments, [int]$Timeout, [int[]]$SuccessCodes, [string]$WorkingDirectory = $Root, [switch]$IgnoreCancellation, [switch]$CaptureOutput, [switch]$SuppressOutput, [switch]$PassExitCode) {
+    function Invoke-Program([string]$File, [string]$Arguments, [int]$Timeout, [int[]]$SuccessCodes, [string]$WorkingDirectory = $Root, [switch]$IgnoreCancellation, [switch]$CaptureOutput, [switch]$SuppressOutput, [switch]$PassExitCode, [switch]$AllowSkip) {
         if (-not $IgnoreCancellation) { Assert-Running }
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $File
@@ -823,8 +826,14 @@ $worker = {
         $info.RedirectStandardError = $true
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $info
+        $skip = $null
         try {
             [void]$process.Start()
+            if ($AllowSkip) {
+                $skip = [hashtable]::Synchronized(@{ Requested = $false })
+                Publish InstallerSkip $skip
+                Write-Log "รอตัวติดตั้ง $([IO.Path]::GetFileName($File)) ได้สูงสุด $Timeout วินาที"
+            }
             if ($SuppressOutput) {
                 $stdout = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
                 $stderr = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
@@ -833,15 +842,27 @@ $worker = {
                 $stderr = $process.StandardError.ReadToEndAsync()
             }
             $timer = [Diagnostics.Stopwatch]::StartNew()
+            $nextWaitLog = 30
             while (-not $process.WaitForExit(250)) {
-                if ($timer.Elapsed.TotalSeconds -ge $Timeout) {
+                if ($skip.Requested -or $timer.Elapsed.TotalSeconds -ge $Timeout) {
+                    $skipped = $skip.Requested
+                    $reason = if ($skipped) { 'ข้ามตามคำสั่งผู้ใช้' } else { 'หมดเวลารอ' }
                     $kill = Start-Process "$env:SystemRoot\System32\taskkill.exe" -ArgumentList "/PID $($process.Id) /T /F" -WindowStyle Hidden -PassThru
                     try {
-                        if (-not $kill.WaitForExit(5000) -or -not $process.WaitForExit(5000)) {
-                            throw "หมดเวลารอ $File และยังยืนยันการหยุดตัวติดตั้งไม่ได้"
+                        if (-not $kill.WaitForExit(5000) -or $kill.ExitCode -ne 0 -or -not $process.WaitForExit(5000)) {
+                            throw "$reason แต่ยังยืนยันการหยุดตัวติดตั้งไม่ได้: $File"
                         }
                     } finally { $kill.Dispose() }
+                    if ($skipped) {
+                        $failure = [InvalidOperationException]::new("ข้ามตัวติดตั้ง $File")
+                        $failure.Data['InstallerSkipped'] = $true
+                        throw $failure
+                    }
                     throw "หมดเวลารอ $File ($Timeout วินาที)"
+                }
+                if ($AllowSkip -and $timer.Elapsed.TotalSeconds -ge $nextWaitLog) {
+                    Write-Log "ยังรอตัวติดตั้ง $([IO.Path]::GetFileName($File)) ($nextWaitLog/$Timeout วินาที)"
+                    $nextWaitLog += 30
                 }
             }
             if (-not $CaptureOutput -and -not $SuppressOutput) {
@@ -856,7 +877,10 @@ $worker = {
             if (-not $IgnoreCancellation) { Assert-Running }
             if ($PassExitCode) { return $code }
             if ($CaptureOutput -and -not $SuppressOutput -and $stdout.Wait(1000)) { return $stdout.Result }
-        } finally { $process.Dispose() }
+        } finally {
+            if ($null -ne $skip) { Publish InstallerSkip $null }
+            $process.Dispose()
+        }
     }
     function Update-OfficeLicense {
         try {
@@ -1098,6 +1122,10 @@ $poll.Add_Tick({
                     $ui.Reboot = $true
                     $ui.AutoRestart = $eventItem.Value
                 }
+                InstallerSkip {
+                    $ui.InstallerSkip = $eventItem.Value
+                    $controls.SkipInstallerButton.IsEnabled = $null -ne $ui.InstallerSkip -and -not $ui.Token.IsCancellationRequested
+                }
                 ResumeCleared { if ($ui.Resume) { $ui.ResumeFinished = $true } }
             }
         }
@@ -1275,6 +1303,7 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
                     if ($entry.Enabled -eq $false) { 'ข้าม: ปิดใน config.json' }
                     elseif (Find-InstalledProgram $entry $programs) {
                         if ($key -eq 'ACDSee') { 'ติดตั้งแล้ว มีขั้นตอนหลังติดตั้ง' }
+                        elseif ($entry.Reinstall -eq $true) { 'ติดตั้งแล้ว จะติดตั้งทับ' }
                         else { 'ข้าม: ติดตั้งแล้ว' }
                     } else {
                         $folder = Get-PayloadEntryFolder $key $entry
@@ -1360,7 +1389,13 @@ $controls.InstallOffice.Add_Click({
 $controls.CancelButton.Add_Click({
     $ui.Token.Cancel()
     $controls.CancelButton.IsEnabled = $false
+    $controls.SkipInstallerButton.IsEnabled = $false
     Set-WaitStatus 'กำลังรอให้ขั้นตอนปัจจุบันสิ้นสุดก่อนยกเลิก'
+})
+$controls.SkipInstallerButton.Add_Click({
+    if ($null -eq $ui.InstallerSkip) { return }
+    $ui.InstallerSkip.Requested = $true
+    $controls.SkipInstallerButton.IsEnabled = $false
 })
 $controls.LogsButton.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $logDir) })
 function Request-WindowsRestart {

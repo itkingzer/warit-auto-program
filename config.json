@@ -93,7 +93,16 @@
                                       "DetectName":  "^Adobe Photoshop CS6(?:\\s|$)",
                                       "File":  "Adobe Photoshop CS6 Extended 13.1.2.exe",
                                       "AutorunSkipExitCodes":  [5],
-                                      "Arguments":  "/S",
+                                      "Arguments":  "-y -gm2",
+                                      "Reinstall":  true,
+                                      "Enabled":  true
+                                  },
+                                  {
+                                      "Name":  "Google Chrome",
+                                      "DetectName":  "^Google Chrome$",
+                                      "File":  "ChromeStandaloneSetup64.exe",
+                                      "Arguments":  "/silent /install",
+                                      "TimeoutSeconds":  300,
                                       "Enabled":  true
                                   },
                                   {

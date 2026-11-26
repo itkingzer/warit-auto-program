@@ -22,6 +22,9 @@ function Find-InstalledProgram($Entry, $Programs) {
     if ($Entry.DetectName) {
         $Programs | Where-Object { $_.DisplayName -match $Entry.DetectName } | Select-Object -First 1
     }
+    elseif ($Entry.Name) {
+        $Programs | Where-Object DisplayName -eq $Entry.Name | Select-Object -First 1
+    }
 }
 
 function Get-LocalInstallerProblem($File, [string]$Group, $Entry) {
@@ -283,7 +286,8 @@ function Invoke-AppRecipe($Entry, [object[]]$Steps, [int]$Timeout, [string]$Fold
         $arguments = if ($step.Main) { [string]$Entry.Arguments } else { '' }
         Write-Log "$name | ขั้นตอน $index/$($Steps.Count): $($file.Name) ($($step.Kind))"
         $run = @{ File = $file.FullName; Arguments = $arguments; Timeout = $Timeout
-            SuccessCodes = @(0,3010,1641); WorkingDirectory = $Folder; PassExitCode = $true }
+            SuccessCodes = @(0,3010,1641); WorkingDirectory = $Folder; PassExitCode = $true
+            AllowSkip = $step.Main -and $step.Kind -eq 'Silent' }
         switch ($step.Kind) {
             'Cmd' {
                 $run.File = "$env:SystemRoot\System32\cmd.exe"
@@ -310,6 +314,7 @@ function Invoke-AppRecipe($Entry, [object[]]$Steps, [int]$Timeout, [string]$Fold
             Write-Log "จบ ${name}: ยกเลิกที่ขั้นตอน $($file.Name)"
             throw
         } catch {
+            if ($_.Exception.Data['InstallerSkipped']) { throw }
             $outcome = if ($mainCompleted) { 'ติดตั้งโปรแกรมสำเร็จ แต่ขั้นตอนหลังติดตั้งล้มเหลว' }
                 else { 'ติดตั้งไม่สำเร็จ' }
             if ($restart) { $outcome += ' และมีขั้นตอนที่แจ้งให้รีสตาร์ท' }
@@ -326,12 +331,29 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
     $entries = @($Config.Packages.$Group | Where-Object { $_ -and $_.Enabled -ne $false })
     if (-not $entries) { Write-Log "ข้าม $Group เนื่องจากไม่มีรายการที่เปิดใช้ใน config.json"; return }
     $programs = @(Get-InstalledProgramRecords)
+    $chromeOffline = if ($Group -eq 'Apps') {
+        $entries | Where-Object { $_.Name -eq 'Google Chrome' -and $_.File -eq 'ChromeStandaloneSetup64.exe' } | Select-Object -First 1
+    }
+    if ($chromeOffline -and -not (Test-Path -LiteralPath (Join-Path (Get-PayloadEntryFolder $Group $chromeOffline) $chromeOffline.File) -PathType Leaf)) {
+        $chromeOffline = $null
+    }
+    $chromeAttempted = $false
     foreach ($entry in $entries) {
         Assert-Running
         $installed = Find-InstalledProgram $entry $programs
         $folder = Get-PayloadEntryFolder $Group $entry
         $timeout = if ($entry.TimeoutSeconds -gt 0) { [int]$entry.TimeoutSeconds } else { [int]$Config.InstallerTimeoutSeconds }
-        if ($installed) {
+        $isChrome = $Group -eq 'Apps' -and ($entry.Name -in 'Chrome','Google Chrome' -or
+            $entry.File -match '^(Chrome|ChromeSetup|chrome_installer|ChromeStandaloneSetup(?:64)?|GoogleChromeStandaloneEnterprise(?:64)?)\.(exe|msi)$')
+        if ($isChrome) {
+            if ($chromeAttempted -or ($chromeOffline -and -not [object]::ReferenceEquals($entry, $chromeOffline))) {
+                Write-Log "ข้าม $($entry.Name): มีรายการ Google Chrome ในคิวแล้ว"
+                continue
+            }
+            $installed = $programs | Where-Object DisplayName -eq 'Google Chrome' | Select-Object -First 1
+            $timeout = [Math]::Min($timeout, 300)
+        }
+        if ($installed -and $entry.Reinstall -ne $true) {
             if ($Group -eq 'ACDSee') {
                 if ($SkipMissing -and -not (Test-Path -LiteralPath $folder -PathType Container)) {
                     if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
@@ -371,48 +393,59 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
                 continue
             }
         } elseif ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "ไม่รองรับลิงก์: $file" }
-        if ($Group -eq 'Apps' -and $entry.InstallMode) {
-            Invoke-AppRecipe $entry $steps $timeout $folder
-            continue
-        }
-        if ($Group -eq 'ACDSee') {
-            $postInstallFiles = @(Get-ACDSeePostInstallFiles $folder)
-            Install-ACDSeeSilently $file.FullName $timeout
-            if (-not (Find-InstalledProgram $entry @(Get-InstalledProgramRecords))) {
-                throw 'ไม่พบ ACDSee ในรายการโปรแกรมหลังติดตั้ง จึงยังไม่ทำขั้นตอนถัดไป'
-            }
-            Invoke-ACDSeePostInstall $postInstallFiles $folder $timeout
-            continue
-        }
-        Write-Log "เริ่ม $($entry.Name)"
-        $codes = if ($null -ne $entry.SuccessCodes) { @($entry.SuccessCodes) } else { @(0,3010,1641) }
-        $arguments = [string]$entry.Arguments
-        if ($Group -eq 'Office' -and $file.Name -eq 'office-install.cmd') {
-            $xml = Join-Path $folder 'office-retail-2024.xml'
-            if (-not (Test-Path -LiteralPath $xml -PathType Leaf)) {
-                if (-not ($SkipMissing -or $SkipUnavailable)) { throw 'ไม่พบ office-retail-2024.xml' }
-                if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
-                Write-Log "ข้าม $($entry.Name) เนื่องจากไม่พบ office-retail-2024.xml"
+        if ($isChrome) { $chromeAttempted = $true }
+        try {
+            if ($Group -eq 'Apps' -and $entry.InstallMode) {
+                Invoke-AppRecipe $entry $steps $timeout $folder
                 continue
             }
-            Initialize-OfficeDeploymentTool $folder
-            Invoke-Program (Join-Path $folder 'setup.exe') ('/configure "{0}"' -f $xml) $timeout $codes -WorkingDirectory $folder
-            continue
-        }
-        switch ($file.Extension.ToLowerInvariant()) {
-            '.exe' {
-                $skipCodes = @(if ($SkipUnavailable -and $Group -eq 'Apps') { $entry.AutorunSkipExitCodes })
-                $exitCode = Invoke-Program $file.FullName $arguments $timeout (@($codes) + $skipCodes) -WorkingDirectory $folder -PassExitCode
-                if ($exitCode -notin $codes) {
-                    if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
-                    Write-Log "Autorun: ติดตั้ง $($entry.Name) ไม่สำเร็จ (Exit Code $exitCode) ข้ามไปทำรายการถัดไป"
+            if ($Group -eq 'ACDSee') {
+                $postInstallFiles = @(Get-ACDSeePostInstallFiles $folder)
+                Install-ACDSeeSilently $file.FullName $timeout
+                if (-not (Find-InstalledProgram $entry @(Get-InstalledProgramRecords))) {
+                    throw 'ไม่พบ ACDSee ในรายการโปรแกรมหลังติดตั้ง จึงยังไม่ทำขั้นตอนถัดไป'
                 }
+                Invoke-ACDSeePostInstall $postInstallFiles $folder $timeout
+                continue
             }
-            '.msi' { Invoke-Program "$env:SystemRoot\System32\msiexec.exe" ('/i "{0}" /qn /norestart {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
-            { $_ -in '.cmd','.bat' } { Invoke-Program "$env:SystemRoot\System32\cmd.exe" ('/d /s /c ""{0}" {1}"' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
-            '.ps1' { Invoke-Program "$PSHOME\powershell.exe" ('-NoProfile -NonInteractive -File "{0}" {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
-            '.reg' { Invoke-Program "$env:SystemRoot\System32\reg.exe" ('import "{0}"' -f $file.FullName) $timeout $codes -WorkingDirectory $folder }
-            default { throw "ไม่รองรับชนิดไฟล์ $($file.Extension)" }
+            if ($installed -and $entry.Reinstall -eq $true) {
+                Write-Log "เริ่มติดตั้งทับ $($entry.Name) (เดิม $($installed.DisplayVersion))"
+            } else {
+                Write-Log "เริ่ม $($entry.Name)"
+            }
+            $codes = if ($null -ne $entry.SuccessCodes) { @($entry.SuccessCodes) } else { @(0,3010,1641) }
+            $arguments = [string]$entry.Arguments
+            if ($Group -eq 'Office' -and $file.Name -eq 'office-install.cmd') {
+                $xml = Join-Path $folder 'office-retail-2024.xml'
+                if (-not (Test-Path -LiteralPath $xml -PathType Leaf)) {
+                    if (-not ($SkipMissing -or $SkipUnavailable)) { throw 'ไม่พบ office-retail-2024.xml' }
+                    if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
+                    Write-Log "ข้าม $($entry.Name) เนื่องจากไม่พบ office-retail-2024.xml"
+                    continue
+                }
+                Initialize-OfficeDeploymentTool $folder
+                Invoke-Program (Join-Path $folder 'setup.exe') ('/configure "{0}"' -f $xml) $timeout $codes -WorkingDirectory $folder
+                continue
+            }
+            switch ($file.Extension.ToLowerInvariant()) {
+                '.exe' {
+                    $skipCodes = @(if ($SkipUnavailable -and $Group -eq 'Apps') { $entry.AutorunSkipExitCodes })
+                    $exitCode = Invoke-Program $file.FullName $arguments $timeout (@($codes) + $skipCodes) -WorkingDirectory $folder -PassExitCode -AllowSkip:($Group -eq 'Apps')
+                    if ($exitCode -notin $codes) {
+                        if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
+                        Write-Log "Autorun: ติดตั้ง $($entry.Name) ไม่สำเร็จ (Exit Code $exitCode) ข้ามไปทำรายการถัดไป"
+                    }
+                }
+                '.msi' { Invoke-Program "$env:SystemRoot\System32\msiexec.exe" ('/i "{0}" /qn /norestart {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder -AllowSkip:($Group -eq 'Apps') }
+                { $_ -in '.cmd','.bat' } { Invoke-Program "$env:SystemRoot\System32\cmd.exe" ('/d /s /c ""{0}" {1}"' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
+                '.ps1' { Invoke-Program "$PSHOME\powershell.exe" ('-NoProfile -NonInteractive -File "{0}" {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
+                '.reg' { Invoke-Program "$env:SystemRoot\System32\reg.exe" ('import "{0}"' -f $file.FullName) $timeout $codes -WorkingDirectory $folder }
+                default { throw "ไม่รองรับชนิดไฟล์ $($file.Extension)" }
+            }
+        } catch {
+            if (-not $_.Exception.Data['InstallerSkipped']) { throw }
+            if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
+            Write-Log "ข้าม $($entry.Name) ตามคำสั่งผู้ใช้"
         }
     }
 }
