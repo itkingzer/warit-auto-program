@@ -1,22 +1,19 @@
 param([switch]$AutoInstall)
 
 $ErrorActionPreference = 'Stop'
-$gui = Join-Path $PSScriptRoot 'AutoSetup-GUI.ps1'
-if (-not (Test-Path -LiteralPath $gui -PathType Leaf)) { throw 'AutoSetup-GUI.ps1 not found.' }
-$launcher = Join-Path $PSScriptRoot 'Start-AutoSetup.vbs'
-if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Start-AutoSetup.vbs not found.' }
-
-$startup = [Environment]::GetFolderPath('Startup', 'Create')
-if (-not $startup) { throw 'Windows Startup folder not found.' }
-
+$startup = [Environment]::GetFolderPath('Startup')
+if (-not $startup) { return }
 $path = Join-Path $startup 'Warit Auto Setup.lnk'
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($path)
-$shortcut.TargetPath = "$env:SystemRoot\System32\wscript.exe"
-$shortcut.Arguments = '"{0}" -StartupLaunch' -f $launcher
-if ($AutoInstall) { $shortcut.Arguments += ' -AutoInstall' }
-$shortcut.WorkingDirectory = $PSScriptRoot
-$shortcut.IconLocation = '{0},0' -f (Join-Path $PSScriptRoot 'assets\app.ico')
-$shortcut.Save()
-[IO.File]::Delete((Join-Path $PSScriptRoot 'update-completed.flag'))
-Write-Output $path
+$launcher = Join-Path $PSScriptRoot 'Start-AutoSetup.vbs'
+$gui = Join-Path $PSScriptRoot 'AutoSetup-GUI.ps1'
+$scriptArguments = '"{0}" -StartupLaunch' -f $launcher
+$powershellArguments = '-NoProfile -STA -ExecutionPolicy RemoteSigned -File "{0}" -StartupLaunch' -f $gui
+$legacyArguments = @($scriptArguments, "$scriptArguments -AutoInstall",
+    $powershellArguments, "$powershellArguments -AutoInstall")
+if ($shortcut.Arguments -in $legacyArguments) {
+    Remove-Item -LiteralPath $path -ErrorAction Stop
+}

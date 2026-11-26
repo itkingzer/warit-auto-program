@@ -291,7 +291,7 @@ function Show-AppSelection($Owner, [string]$AppsPath, [string]$ConfigPath, $Conf
           </StackPanel>
           <StackPanel>
             <TextBlock Text="เลือกรายการโปรแกรม" FontSize="26" FontWeight="SemiBold" TextWrapping="Wrap"/>
-            <TextBlock Text="รายการที่เลือกจะใช้เมื่อกดเริ่มและเมื่อ Autorun แบบ AutoInstall" Foreground="{DynamicResource MutedBrush}" Margin="0,5,0,0" TextWrapping="Wrap"/>
+            <TextBlock Text="รายการที่เลือกจะใช้เมื่อกดเริ่มงาน" Foreground="{DynamicResource MutedBrush}" Margin="0,5,0,0" TextWrapping="Wrap"/>
           </StackPanel>
         </DockPanel>
       </Border>

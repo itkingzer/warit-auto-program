@@ -201,3 +201,35 @@ function Enable-SmbFileSharing {
     }
     Write-Log 'เปิด SMB 2/3 แล้ว กฎ Firewall อนุญาต TCP 445 บน Private เฉพาะ Local Subnet'
 }
+
+function Enable-SetupWindowsFeatures([string[]]$FeatureNames) {
+    Assert-Running
+    $available = @{}
+    foreach ($feature in Get-WindowsOptionalFeature -Online) {
+        $available[$feature.FeatureName] = $feature.State
+    }
+    foreach ($name in $FeatureNames) {
+        Assert-Running
+        if (-not $available.ContainsKey($name)) {
+            Write-Log "Windows Features: รุ่นนี้ไม่มี $name"
+            continue
+        }
+        if ($available[$name] -eq 'Enabled') {
+            Write-Log "Windows Features: เปิด $name ไว้แล้ว"
+            continue
+        }
+        if ($available[$name] -eq 'EnablePending') {
+            $script:WindowsFeatureRestartRequired = $true
+            Write-Log "Windows Features: $name รอรีสตาร์ท"
+            continue
+        }
+        Write-Log "Windows Features: กำลังเปิด $name"
+        $result = Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart
+        if ($result.RestartNeeded) {
+            $script:WindowsFeatureRestartRequired = $true
+            Write-Log "Windows Features: $name รอรีสตาร์ท"
+        } else {
+            Write-Log "Windows Features: เปิด $name แล้ว"
+        }
+    }
+}

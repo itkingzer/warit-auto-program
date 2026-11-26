@@ -4,16 +4,11 @@ param([switch]$ResumeOnly, [switch]$StartupLaunch, [switch]$AutoInstall)
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $StatePath = Join-Path $Root state.json
-function Test-UpdateOwnsStartup {
-    if (Test-Path -LiteralPath (Join-Path $Root 'update-completed.flag') -PathType Leaf) { return $true }
-    if (-not (Test-Path -LiteralPath $StatePath)) { return $false }
-    $startupState = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($startupState.Mode -eq 'UpdateLoop') { return $true }
-    if (-not $startupState.UpdateBoot) { return $false }
-    $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
-    return $startupState.UpdateBoot -eq $boot.ToUniversalTime().Ticks.ToString()
+if ($StartupLaunch -and -not $ResumeOnly) {
+    & (Join-Path $Root 'Install-Autorun.ps1')
+    return
 }
-if ($StartupLaunch -and -not $ResumeOnly -and (Test-UpdateOwnsStartup)) { return }
+if ($ResumeOnly -and -not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -29,8 +24,6 @@ if (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -
         WindowStyle = 'Hidden'
     }
     if ($ResumeOnly) { $launch.ArgumentList += ' -ResumeOnly' }
-    if ($StartupLaunch) { $launch.ArgumentList += ' -StartupLaunch' }
-    if ($AutoInstall) { $launch.ArgumentList += ' -AutoInstall' }
     if (-not $admin) { $launch.Verb = 'RunAs' }
     Start-Process @launch
     return
@@ -59,18 +52,36 @@ if (-not $locked) {
     return
 }
 try {
-if ($StartupLaunch -and -not $ResumeOnly -and (Test-UpdateOwnsStartup)) { return }
 $ResumeTask = 'WaritAutoSetup-WindowsUpdateResume'
 $resume = $false
-$resumeAutoRestart = $false
 if (Test-Path -LiteralPath $StatePath) {
     $updateState = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $mode = $updateState.Mode
     if ($mode -notin 'Idle','UpdateLoop') { throw "state.json มี Mode ที่ไม่รองรับ: $mode" }
-    $resume = $mode -eq 'UpdateLoop'
-    $resumeAutoRestart = $resume -and $updateState.AutoRestart -eq $true
+    if ($mode -eq 'UpdateLoop') {
+        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+        $restartFromBoot = $updateState.RestartFromBoot
+        $resume = if ($restartFromBoot) {
+            $restartFromBoot -ne $boot.Ticks.ToString()
+        } else {
+            # Older pending states did not record the boot identifier.
+            $stateWritten = [IO.File]::GetLastWriteTimeUtc($StatePath)
+            $restartFromBoot = $stateWritten.Ticks.ToString()
+            $boot -gt $stateWritten
+        }
+    }
 }
 if ($ResumeOnly -and -not $resume) { return }
+if ($ResumeOnly) {
+    $resumeBoot = $boot.Ticks.ToString()
+    if ($updateState.LastResumeBoot -eq $resumeBoot) { return }
+    . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
+    Save-UpdateState @{
+        Mode = 'UpdateLoop'
+        RestartFromBoot = $restartFromBoot
+        LastResumeBoot = $resumeBoot
+    }
+}
 $configPath = Join-Path $Root 'config.json'
 $Config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([int]$Config.InstallerTimeoutSeconds -lt 1) { throw 'InstallerTimeoutSeconds ต้องมากกว่า 0' }
@@ -85,6 +96,8 @@ $choices = [ordered]@{
     System = @('Desktop, ภาษา และเวลา', $true)
     GraveAccent = @('สลับภาษาด้วยปุ่ม ` (Grave Accent)', $false)
     SMB = @('เปิด SMB 2/3 สำหรับเครือข่ายส่วนตัว', $false)
+    SMB1 = @('เปิด SMB 1.0/CIFS (Client และ Server)', $false)
+    PrintFeatures = @('เปิด Print and Document Services, Print to PDF และ XPS Document Writer', $false)
     Printer = @('แก้ Printer Error 709 (GPEDIT, RPC และ SMB signing)', $false)
     Fonts = @('ฟอนต์', $true)
     Runtimes = @('Runtimes', $true)
@@ -896,38 +909,43 @@ $worker = {
         $completed = 0
         $printerIncomplete = $false
         $unavailableCount = 0
-        $autoRestart = $WorkerMode -in 'Autorun','UpdateResumeAuto'
         foreach ($key in $Selected) {
             Assert-Running
             Publish Step $key
             if ($key -ne 'ACDSee') { Write-Log "เริ่ม $key" }
             switch ($key) {
                 SMB { Enable-SmbFileSharing }
+                SMB1 { Enable-SetupWindowsFeatures 'SMB1Protocol','SMB1Protocol-Client','SMB1Protocol-Server' }
+                PrintFeatures {
+                    Enable-SetupWindowsFeatures 'Printing-Foundation-Features','Printing-Foundation-InternetPrinting-Client',
+                        'Printing-Foundation-LPDPrintService','Printing-Foundation-LPRPortMonitor',
+                        'Printing-PrintToPDFServices-Features','Printing-XPSServices-Features'
+                }
                 Disk { Invoke-DiskAndData -DataPercent $DataPercent }
                 System { Invoke-SystemTweaks }
                 GraveAccent { Enable-GraveAccentLanguageSwitch }
                 Printer { $printerIncomplete = -not (Invoke-PrinterFix) }
                 Fonts { Install-LocalFonts }
                 Drivers { Invoke-DriverCheck -Install }
-                Update { Invoke-WindowsUpdateLoop -AutoRestart:$autoRestart }
+                Update { Invoke-WindowsUpdateLoop }
                 default {
-                    Invoke-PayloadGroup $key -SkipUnavailable:($WorkerMode -eq 'Autorun') `
-                        -SkipMissing -UnavailableCount ([ref]$unavailableCount)
+                    Invoke-PayloadGroup $key -SkipMissing -UnavailableCount ([ref]$unavailableCount)
                 }
             }
-            if ($script:UpdateRestartPending) { break }
             $completed++
             Publish Progress (100.0 * $completed / $Selected.Count)
             if ($script:DriverRestartRequired) { break }
         }
-        $message = if ($script:DriverRestartRequired) { 'ต้องรีสตาร์ทเครื่องก่อนทำงานที่เหลือ' }
-            elseif ($script:UpdateRestartPending -and $autoRestart) { 'กำลังรีสตาร์ทเครื่องเพื่อทำ Windows Update ต่อ' }
+        Assert-Running
+        $autoRestart = $script:UpdateRestartPending -and $completed -eq $Selected.Count -and -not $printerIncomplete
+        $message = if ($autoRestart) { 'งานที่เลือกเสร็จแล้ว กำลังรีสตาร์ทเพื่อทำ Windows Update ต่อ' }
             elseif ($script:UpdateRestartPending) { 'กดรีสตาร์ทเครื่องและยืนยัน เพื่อทำ Windows Update ต่อ' }
+            elseif ($script:DriverRestartRequired) { 'ต้องรีสตาร์ทเครื่องก่อนทำงานที่เหลือ' }
+            elseif ($script:WindowsFeatureRestartRequired) { 'Windows Features รอรีสตาร์ทเครื่อง ดูรายละเอียดงานใน Log' }
             elseif ($printerIncomplete -and $unavailableCount -gt 0) { "จบงานแล้ว: Printer ไม่สำเร็จและข้าม $unavailableCount รายการ ดูรายละเอียดใน Log" }
             elseif ($printerIncomplete) { 'จบงานแล้ว แต่ขั้นตอน Printer ไม่สำเร็จทั้งหมด ดูรายละเอียดใน Log' }
             elseif ($unavailableCount -gt 0) {
-                $finished = if ($WorkerMode -eq 'Autorun') { 'จบ Autorun แล้ว' } else { 'จบงานแล้ว' }
-                "${finished}: ข้าม $unavailableCount รายการเพราะไฟล์ติดตั้งไม่พร้อม ดูรายละเอียดใน Log"
+                "จบงานแล้ว: ข้าม $unavailableCount รายการ ดูรายละเอียดใน Log"
             }
             else { 'เสร็จสิ้น' }
         if ($Selected.Count -ne 1 -or $Selected[0] -ne 'ACDSee') { Write-Log $message }
@@ -938,6 +956,7 @@ $worker = {
         if (-not $script:UpdateRestartPending -and $Selected -contains 'Office') { Update-OfficeLicense }
         if ($script:UpdateRestartPending) { Publish Reboot $autoRestart }
         elseif ($Selected -contains 'Update') { Publish ResumeCleared $true }
+        if ($script:WindowsFeatureRestartRequired -and -not $script:UpdateRestartPending) { Publish Reboot $false }
     } catch [OperationCanceledException] {
         if ($key -eq 'Drivers') { Publish DriverStatus 'ยกเลิกงานไดรเวอร์แล้ว' }
         if ($key -eq 'Update' -and -not $script:UpdateRestartPending -and (Test-Path -LiteralPath $StatePath) -and
@@ -961,7 +980,8 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     $ui.Mode = $Mode
     $ui.Token = [Threading.CancellationTokenSource]::new()
     $ui.Space = [RunspaceFactory]::CreateRunspace()
-    $ui.Space.ApartmentState = 'STA'
+    # Keep synchronous WUA COM calls on an MTA worker. WPF stays on the GUI thread.
+    $ui.Space.ApartmentState = if ('Update' -in $Selected -or 'Drivers' -in $Selected) { 'MTA' } else { 'STA' }
     $ui.Space.ThreadOptions = 'ReuseThread'
     $ui.Space.Open()
     $ui.Work = [PowerShell]::Create()
@@ -974,10 +994,6 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0) {
     $poll.Start()
 }
 function Set-Busy([bool]$Busy) {
-    if (-not $Busy -and $null -ne $ui.BeforeAutorunSelection) {
-        foreach ($key in $choices.Keys) { $checks[$key].IsChecked = $key -in $ui.BeforeAutorunSelection }
-        $ui.BeforeAutorunSelection = $null
-    }
     if ($Busy) { $controls.StartButton.IsEnabled = $false } else { Update-SelectionSummary }
     $controls.RestartButton.IsEnabled = -not $Busy
     $controls.CancelButton.IsEnabled = $Busy
@@ -1250,6 +1266,7 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
     $plan = @(foreach ($key in $Selected) {
         $choices[$key][0]
         if ($key -eq 'Disk') { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
+        if ($key -eq 'SMB1') { '  • SMB 1.0 เป็นโปรโตคอลเก่า ควรเปิดเมื่อจำเป็นสำหรับอุปกรณ์รุ่นเก่า' }
         if ($key -in 'Apps','Runtimes','LINE','Office','Foxit','ACDSee') {
             $entries = @($Config.Packages.$key | Where-Object { $_ })
             if (-not $entries) { '  • ข้าม: ไม่มีรายการใน config.json' }
@@ -1278,7 +1295,7 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
         foreach ($key in $Hidden) { $plan += "  • $($choices[$key][0])" }
     }
     $restart = @(if ($Selected -contains 'Drivers') { 'หากไดรเวอร์ต้องรีสตาร์ท งานที่เหลือจะหยุดไว้' }
-        if ($Selected -contains 'Update') { 'หาก Windows Update ต้องรีสตาร์ท ให้กดปุ่มรีสตาร์ทในแอปเพื่อทำอัปเดตต่อ' })
+        if ($Selected -contains 'Update') { 'หาก Windows Update ต้องรีสตาร์ท แอปจะรีสตาร์ทอัตโนมัติเมื่องานที่เลือกเสร็จแล้ว' })
 
     [xml]$queueXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1314,11 +1331,10 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
     return $dialog.ShowDialog() -eq $true
 }
 
-function Start-SelectedSetup([switch]$OfficeOnly, [switch]$StartupInstall) {
+function Start-SelectedSetup([switch]$OfficeOnly) {
     if ($ui.Handle -or $ui.Reboot -or $ui.ResumeFinished) { return }
     Update-PayloadTaskVisibility
     $selected = @(if ($ui.Resume) { 'Update' }
-        elseif ($StartupInstall) { 'Printer','Runtimes','Apps','LINE','Office','Update' }
         elseif ($OfficeOnly) { 'Office' } else { $choices.Keys | Where-Object { $checks[$_].IsChecked } })
     $hidden = @($selected | Where-Object { $checks[$_].Visibility -ne 'Visible' })
     $selected = @($selected | Where-Object { $checks[$_].Visibility -eq 'Visible' })
@@ -1328,20 +1344,13 @@ function Start-SelectedSetup([switch]$OfficeOnly, [switch]$StartupInstall) {
         $dataPercent = Show-PartitionDialog
         if ($null -eq $dataPercent) { return }
     }
-    if (-not $StartupInstall -and -not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
-    if ($StartupInstall) {
-        $ui.BeforeAutorunSelection = @($choices.Keys | Where-Object { $checks[$_].IsChecked })
-        foreach ($key in $choices.Keys) { $checks[$key].IsChecked = $key -in $selected }
-    }
+    if (-not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
     if (-not $OfficeOnly) { Show-DetailsDrawer $controls.LogNav }
     $controls.Progress.Value = 0
     $controls.ProgressLabel.Text = '0%'
     $controls.Status.Text = 'กำลังเริ่มงาน'
     Set-Busy $true
-    $mode = if ($ui.Resume -and $resumeAutoRestart) { 'UpdateResumeAuto' }
-        elseif ($StartupInstall) { 'Autorun' }
-        else { 'Setup' }
-    Start-Work $mode $selected $dataPercent
+    Start-Work 'Setup' $selected $dataPercent
 }
 $controls.StartButton.Add_Click({ Start-SelectedSetup })
 $controls.InstallOffice.Add_Click({
@@ -1379,8 +1388,6 @@ $Window.Add_Closing({
 
 if ($resume) {
     $Window.Add_ContentRendered({ Start-SelectedSetup })
-} elseif ($StartupLaunch -and $AutoInstall) {
-    $Window.Add_ContentRendered({ Start-SelectedSetup -StartupInstall })
 } else {
     $Window.Add_ContentRendered({ Start-InventoryScan })
 }

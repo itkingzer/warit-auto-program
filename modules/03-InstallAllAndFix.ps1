@@ -400,7 +400,14 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
             continue
         }
         switch ($file.Extension.ToLowerInvariant()) {
-            '.exe' { Invoke-Program $file.FullName $arguments $timeout $codes -WorkingDirectory $folder }
+            '.exe' {
+                $skipCodes = @(if ($SkipUnavailable -and $Group -eq 'Apps') { $entry.AutorunSkipExitCodes })
+                $exitCode = Invoke-Program $file.FullName $arguments $timeout (@($codes) + $skipCodes) -WorkingDirectory $folder -PassExitCode
+                if ($exitCode -notin $codes) {
+                    if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
+                    Write-Log "Autorun: ติดตั้ง $($entry.Name) ไม่สำเร็จ (Exit Code $exitCode) ข้ามไปทำรายการถัดไป"
+                }
+            }
             '.msi' { Invoke-Program "$env:SystemRoot\System32\msiexec.exe" ('/i "{0}" /qn /norestart {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
             { $_ -in '.cmd','.bat' } { Invoke-Program "$env:SystemRoot\System32\cmd.exe" ('/d /s /c ""{0}" {1}"' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
             '.ps1' { Invoke-Program "$PSHOME\powershell.exe" ('-NoProfile -NonInteractive -File "{0}" {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }

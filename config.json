@@ -92,6 +92,7 @@
                                       "Name":  "Adobe Photoshop CS6 Extended",
                                       "DetectName":  "^Adobe Photoshop CS6(?:\\s|$)",
                                       "File":  "Adobe Photoshop CS6 Extended 13.1.2.exe",
+                                      "AutorunSkipExitCodes":  [5],
                                       "Arguments":  "/S",
                                       "Enabled":  true
                                   },
