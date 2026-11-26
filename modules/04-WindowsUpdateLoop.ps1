@@ -24,8 +24,12 @@ function Save-UpdateRestart([object[]]$UpdateList, [hashtable]$Processed, [strin
     }
     # ใช้บัญชีเดิมและเปิดหน้าต่างเมื่อบัญชีนั้นเข้าสู่ระบบหลังรีสตาร์ท
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $launcher = Join-Path $Root 'Start-AutoSetup.vbs'
-    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument ('"{0}" -ResumeOnly' -f $launcher) -WorkingDirectory $Root
+    if ($HostedExe) {
+        $action = New-ScheduledTaskAction -Execute $HostedExe -Argument '-ResumeOnly' -WorkingDirectory (Split-Path -Parent $HostedExe)
+    } else {
+        $launcher = Join-Path $Root 'Start-AutoSetup.vbs'
+        $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument ('"{0}" -ResumeOnly' -f $launcher) -WorkingDirectory $Root
+    }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)

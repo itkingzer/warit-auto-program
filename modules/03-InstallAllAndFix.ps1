@@ -105,7 +105,7 @@ function Get-PackagePayloadStatus([string]$Group, $Entry, [string]$Folder) {
 }
 
 function Get-PayloadReport {
-    $path = Join-Path $Root 'payloads'
+    $path = $PayloadRoot
     "ตำแหน่ง: $path"
     if (-not (Test-Path -LiteralPath $path -PathType Container)) {
         'ไม่พบโฟลเดอร์ payloads ให้วางไว้ข้าง Start-AutoSetup.vbs แล้วกดตรวจใหม่'
@@ -263,7 +263,7 @@ function Install-ACDSeeSilently([string]$Package, [int]$Timeout) {
 }
 
 function Get-PayloadEntryFolder([string]$Group, $Entry) {
-    $folder = Join-Path $Root ('payloads\' + $PayloadFolders[$Group])
+    $folder = Join-Path $PayloadRoot $PayloadFolders[$Group]
     if ($Group -eq 'Apps' -and $Entry.Subfolder) {
         $subfolder = [string]$Entry.Subfolder
         if ($subfolder -in '.', '..' -or $subfolder.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
@@ -469,7 +469,7 @@ function Invoke-PrinterFix([switch]$ChangeSmbSigning) {
     Assert-Running
     try {
         $folderName = $PayloadFolders.Printer
-        $source = Join-Path $Root ('payloads\' + $folderName)
+        $source = Join-Path $PayloadRoot $folderName
         if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "ไม่พบโฟลเดอร์ Printer: $source" }
         $fixSubfolder = 'Code error 709'
         $sourceFixFolder = Join-Path $source $fixSubfolder
@@ -524,7 +524,7 @@ function Invoke-PrinterFix([switch]$ChangeSmbSigning) {
 }
 
 function Get-LocalFontFiles {
-    $source = Join-Path $Root 'payloads\++Front'
+    $source = Join-Path $PayloadRoot '++Front'
     if (Test-Path -LiteralPath $source -PathType Container) {
         Get-ChildItem -LiteralPath $source -File | Where-Object Extension -in '.ttf','.otf','.ttc'
     }

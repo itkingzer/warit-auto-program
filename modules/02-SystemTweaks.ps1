@@ -10,7 +10,7 @@
     $wallpaperName = [string]$Config.Personalization.Wallpaper
     $wallpaperPath = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img0.jpg'
     if ($wallpaperName) {
-        $wallpaperPath = Join-Path (Join-Path $Root 'payloads\Wallpaper') $wallpaperName
+        $wallpaperPath = Join-Path (Join-Path $PayloadRoot 'Wallpaper') $wallpaperName
     }
     if (-not (Test-Path -LiteralPath $wallpaperPath -PathType Leaf)) {
         throw "ไม่พบไฟล์ภาพพื้นหลัง: $wallpaperPath"

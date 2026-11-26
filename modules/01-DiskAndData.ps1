@@ -24,12 +24,46 @@ function Get-DataPartitionId($Partition) {
     return [string]$Partition.ObjectId
 }
 
+function Get-WindowsDataDrive($WindowsPartition) {
+    $drive = @(Get-Partition -DriveLetter D -ErrorAction SilentlyContinue | Where-Object { $_ })
+    if ($drive.Count -eq 0) {
+        if ((Get-PSDrive -Name D -ErrorAction SilentlyContinue) -or
+            ([IO.DriveInfo]::GetDrives().Name -contains 'D:\') -or
+            (Get-Volume -DriveLetter D -ErrorAction SilentlyContinue)) {
+            throw 'D: ถูกใช้งานอยู่และตรวจยืนยันพาร์ติชันไม่ได้ กรุณาทำให้ D: ว่างก่อนเริ่มงาน'
+        }
+        return
+    }
+    if ($drive.Count -ne 1 -or $drive[0].DiskNumber -ne $WindowsPartition.DiskNumber) {
+        throw 'D: เป็นของดิสก์อื่น เช่น SSD ภายนอก กรุณาถอดไดรฟ์ภายนอกหรือเปลี่ยนอักษรไดรฟ์ใน Disk Management แล้วลองใหม่'
+    }
+    if ($drive[0].PartitionNumber -eq $WindowsPartition.PartitionNumber) {
+        throw 'D: เป็นไดรฟ์ Windows จึงใช้เป็นปลายทาง Data ไม่ได้'
+    }
+    $drive[0]
+}
+
+function Assert-DataDriveAssignment($WindowsPartition, $ExpectedPartition) {
+    $drive = Get-WindowsDataDrive $WindowsPartition
+    if (-not $ExpectedPartition) {
+        if ($drive) { throw 'D: ถูกใช้งานอยู่ กรุณาตรวจพาร์ติชันและอักษรไดรฟ์ใน Disk Management' }
+        return
+    }
+    if (-not $drive -or $drive.DiskNumber -ne $ExpectedPartition.DiskNumber -or
+        $drive.PartitionNumber -ne $ExpectedPartition.PartitionNumber -or
+        $drive.Offset -ne $ExpectedPartition.Offset -or $drive.Size -ne $ExpectedPartition.Size -or
+        (Get-DataPartitionId $drive) -ne (Get-DataPartitionId $ExpectedPartition)) {
+        throw 'พาร์ติชัน Data ที่ตรวจไว้ไม่ได้ใช้ D: กรุณาตรวจอักษรไดรฟ์ใน Disk Management'
+    }
+}
+
 function Invoke-DiskAndData {
-    param([Parameter(Mandatory)][ValidateRange(1,99)][int]$DataPercent)
+    param([Parameter(Mandatory)][ValidateRange(0,99)][int]$DataPercent)
     # จำกัดการแบ่งพาร์ติชันไว้ที่ดิสก์ของ Windows ปัจจุบัน
     $os = Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))
+    $null = Get-WindowsDataDrive $os
     $disk = Get-Disk -Number $os.DiskNumber
-    $source = Join-Path $Root 'payloads\ใส่ให้ลูกค้า'
+    $source = Join-Path $PayloadRoot 'ใส่ให้ลูกค้า'
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "ไม่พบ $source" }
     $planDirectory = Join-Path $env:ProgramData 'WaritAutoSetup'
     $planPath = Join-Path $planDirectory 'data-partition.json'
@@ -46,8 +80,8 @@ function Invoke-DiskAndData {
     })
     if ($data.Count -gt 1) { throw 'พบ Volume ชื่อ Data มากกว่าหนึ่งรายการบนดิสก์ Windows' }
     if ($data.Count -eq 1) {
-        if ($data[0].PartitionNumber -eq $os.PartitionNumber -or -not $data[0].DriveLetter) {
-            throw 'Volume Data ต้องเป็นพาร์ติชันแยกที่มีอักษรไดรฟ์'
+        if ($data[0].DriveLetter -ne 'D') {
+            throw 'พบ Volume Data ที่ไม่ได้ใช้อักษร D: กรุณาตรวจอักษรไดรฟ์ใน Disk Management'
         }
         if ($saved -and (-not $saved.DataId -or $saved.DataId -ne (Get-DataPartitionId $data[0]) -or
             $saved.DataOffset -ne $data[0].Offset -or $saved.DataSize -ne $data[0].Size)) {
@@ -55,6 +89,9 @@ function Invoke-DiskAndData {
         }
         $partition = $data[0]
     } else {
+        if (-not $saved -and $DataPercent -eq 0) {
+            throw 'ไม่พบ Data (D:) หรือแผนเดิมแล้ว กรุณาเริ่มงานใหม่เพื่อตรวจดิสก์อีกครั้ง'
+        }
         if ($disk.IsOffline -or $disk.IsReadOnly -or -not $disk.UniqueId -or $disk.PartitionStyle -notin @('GPT','MBR')) {
             throw 'ดิสก์ Windows ไม่รองรับการแบ่งพาร์ติชันจากโปรแกรมนี้'
         }
@@ -91,6 +128,7 @@ function Invoke-DiskAndData {
                 throw 'พบพาร์ติชันที่ไม่ตรงกับแผน Data ที่ค้างไว้ ให้ตรวจ Disk Management'
             }
         } else {
+            Assert-DataDriveAssignment $os
             $limit = Get-PartitionSupportedSize -DriveLetter $os.DriveLetter
             if ($os.Size -lt $target -or $target -lt $limit.SizeMin -or $target -gt $limit.SizeMax) {
                 throw ('แบ่งตามสัดส่วนนี้ไม่ได้: Windows ต้องเหลือ {0:N1} GiB และย่อได้ต่ำสุด {1:N1} GiB' -f ($target / 1GB), ($limit.SizeMin / 1GB))
@@ -99,11 +137,13 @@ function Invoke-DiskAndData {
             New-Item -ItemType Directory -Path $planDirectory -Force | Out-Null
             Save-DataPartitionPlan $planPath $plan
             if ($os.Size -gt $target) {
+                Assert-DataDriveAssignment $os
                 Resize-Partition -DriveLetter $os.DriveLetter -Size $target
                 Write-Log "ย่อ $($os.DriveLetter): เป็น $target ไบต์แล้ว"
             }
             Assert-Running
-            $partition = New-Partition -DiskNumber $disk.Number -Offset $plan.DataOffset -Size $plan.DataSize -AssignDriveLetter
+            Assert-DataDriveAssignment $os
+            $partition = New-Partition -DiskNumber $disk.Number -Offset $plan.DataOffset -Size $plan.DataSize -DriveLetter D
             if (-not (Get-DataPartitionId $partition) -or $partition.Offset -ne $plan.DataOffset -or $partition.Size -ne $plan.DataSize) {
                 throw 'สร้างพาร์ติชันแล้ว แต่ตรวจยืนยันตัวตนหรือขนาดไม่ได้ ให้ตรวจ Disk Management'
             }
@@ -112,17 +152,20 @@ function Invoke-DiskAndData {
             Write-Log "สร้างพาร์ติชัน Data $($partition.PartitionNumber) แล้ว"
         }
         Assert-Running
+        Assert-DataDriveAssignment $os $partition
         $volume = $partition | Get-Volume -ErrorAction Stop
-        if (-not $partition.DriveLetter -or -not $volume -or [string]$volume.FileSystemType -notin @('Unknown','RAW')) {
-            throw 'พาร์ติชันที่ค้างไว้ไม่ได้อยู่ในสถานะ RAW หรือไม่มีอักษรไดรฟ์ ให้ตรวจ Disk Management'
+        if (-not $volume -or [string]$volume.FileSystemType -notin @('Unknown','RAW')) {
+            throw 'พาร์ติชัน D: ที่ค้างไว้ไม่ได้อยู่ในสถานะ RAW ให้ตรวจ Disk Management'
         }
         $partition | Format-Volume -FileSystem NTFS -NewFileSystemLabel Data -Confirm:$false | Out-Null
         Write-Log 'ฟอร์แมต Data เป็น NTFS แล้ว'
     }
 
     Assert-Running
-    $destination = Join-Path ('{0}:\' -f $partition.DriveLetter) (Split-Path $source -Leaf)
+    Assert-DataDriveAssignment $os $partition
+    $destination = 'D:\' + (Split-Path $source -Leaf)
     Invoke-Program -File "$env:SystemRoot\System32\robocopy.exe" -Arguments ('"{0}" "{1}" /E /XJ /IM /R:2 /W:2 /NP /XF .gitkeep' -f $source,$destination) -Timeout 7200 -SuccessCodes (0..7)
+    Assert-DataDriveAssignment $os $partition
     # นับเฉพาะรายการต้นทางและยืนยันขนาดของทุกไฟล์ที่ปลายทาง
     $count = 0L
     $bytes = 0L

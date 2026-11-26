@@ -1,9 +1,21 @@
 ﻿# บังคับสิทธิ์ผู้ดูแลระบบ และใช้ STA สำหรับ WPF
-param([switch]$ResumeOnly, [switch]$StartupLaunch, [switch]$AutoInstall)
+param([switch]$ResumeOnly, [switch]$StartupLaunch, [switch]$AutoInstall,
+    [string]$PayloadRoot, [string]$HostedExe, [string]$DataRoot)
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
-$StatePath = Join-Path $Root state.json
+if (-not $DataRoot) { $DataRoot = $Root }
+$DataRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataRoot)
+$defaultConfig = Join-Path $Root 'default-config.json'
+$bundled = Test-Path -LiteralPath $defaultConfig -PathType Leaf
+if ($PayloadRoot) {
+    $PayloadRoot = [IO.Path]::GetFullPath($PayloadRoot)
+} elseif ($bundled) {
+    $PayloadRoot = Join-Path (Split-Path -Parent $Root) 'payloads'
+} else {
+    $PayloadRoot = Join-Path $DataRoot 'payloads'
+}
+$StatePath = Join-Path $DataRoot state.json
 if ($StartupLaunch -and -not $ResumeOnly) {
     & (Join-Path $Root 'Install-Autorun.ps1')
     return
@@ -16,7 +28,7 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
     $exe = "$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 }
 $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -or $exe -like '*Sysnative*') {
+if (-not $HostedExe -and (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -or $exe -like '*Sysnative*')) {
     $launch = @{
         FilePath = $exe
         ArgumentList = '-NoProfile -STA -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
@@ -24,22 +36,29 @@ if (-not $admin -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -
         WindowStyle = 'Hidden'
     }
     if ($ResumeOnly) { $launch.ArgumentList += ' -ResumeOnly' }
+    $launch.ArgumentList += ' -PayloadRoot "{0}"' -f (Join-Path $PayloadRoot '.')
+    $launch.ArgumentList += ' -DataRoot "{0}"' -f (Join-Path $DataRoot '.')
     if (-not $admin) { $launch.Verb = 'RunAs' }
     $child = Start-Process @launch -Wait -PassThru
     try { exit $child.ExitCode } finally { $child.Dispose() }
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $versionPath = Join-Path $Root 'version.txt'
-$BuildVersion = if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
+$canUpdateApp = -not $HostedExe -and -not $bundled
+$isGitCheckout = Test-Path -LiteralPath (Join-Path $Root '.git')
+$BuildVersion = if ($HostedExe) {
+    [Diagnostics.FileVersionInfo]::GetVersionInfo($HostedExe).ProductVersion
+} elseif (Test-Path -LiteralPath $versionPath -PathType Leaf) {
     (Get-Content -LiteralPath $versionPath -Raw).Trim()
 } else { 'source' }
-$windowTitle = "Warit · Windows Auto Setup ($BuildVersion)"
+$windowTitle = if ($HostedExe) { 'Warit Auto Setup 2' } else { "Warit · Windows Auto Setup ($BuildVersion)" }
 $mutex = [Threading.Mutex]::new($false, 'Global\WaritAutoSetup')
 try { $locked = $mutex.WaitOne(2000) } catch [Threading.AbandonedMutexException] { $locked = $true }
 if (-not $locked) {
     $mutex.Dispose()
     if (-not $StartupLaunch -or $ResumeOnly) {
-        $existing = Get-Process -Name powershell,pwsh -ErrorAction SilentlyContinue |
+        $processNames = if ($HostedExe) { [IO.Path]::GetFileNameWithoutExtension($HostedExe) } else { 'powershell','pwsh' }
+        $existing = Get-Process -Name $processNames -ErrorAction SilentlyContinue |
             Where-Object { $_.MainWindowTitle -eq $windowTitle } | Select-Object -First 1
         if ($existing) {
             Add-Type -Namespace Warit -Name SetupWindow -MemberDefinition @'
@@ -56,7 +75,7 @@ if (-not $locked) {
     return
 }
 try {
-$ResumeTask = 'WaritAutoSetup-WindowsUpdateResume'
+$ResumeTask = if ($bundled -or $HostedExe) { 'WaritAutoSetup2-WindowsUpdateResume' } else { 'WaritAutoSetup-WindowsUpdateResume' }
 $resume = $false
 $resumeUpdates = @()
 $resumeProcessedUpdateKeys = @()
@@ -100,17 +119,23 @@ if ($ResumeOnly) {
         UpdateFailures = $resumeUpdateFailures
     }
 }
-$configPath = Join-Path $Root 'config.json'
+$configPath = Join-Path $DataRoot 'config.json'
+if ($HostedExe -and -not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+    Copy-Item -LiteralPath (Join-Path $Root 'config.json') -Destination $configPath
+}
+if ($bundled -and -not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+    Copy-Item -LiteralPath $defaultConfig -Destination $configPath
+}
 $Config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([int]$Config.InstallerTimeoutSeconds -lt 1) { throw 'InstallerTimeoutSeconds ต้องมากกว่า 0' }
-$logDir = Join-Path $Root logs
+$logDir = Join-Path $DataRoot logs
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $PayloadFolders = @{
     Printer = '+แก้ Code Error Printer'; Runtimes = 'Runtimes'; Apps = 'Apps'; LINE = 'LINE'
     Foxit = '++Foxit PDF Editor Pro'; ACDSee = '++ACDSee Photo Studio Ultimate'; Office = 'Office'
 }
 $choices = [ordered]@{
-    Disk = @('แบ่งดิสก์และคัดลอกไฟล์ลูกค้า', $false)
+    Disk = @('แบ่งไดรฟ์ D: และคัดลอกไฟล์ลูกค้า', $false)
     System = @('Desktop, ภาษา และเวลา', $true)
     GraveAccent = @('สลับภาษาด้วยปุ่ม ` (Grave Accent)', $false)
     SMB = @('เปิด SMB 2/3 สำหรับเครือข่ายส่วนตัว', $false)
@@ -438,6 +463,8 @@ $choices = [ordered]@{
                 </DockPanel>
                 <WrapPanel Name="QuickActions">
                   <Button Name="AppsOnlyButton" MinHeight="34" Content="โปรแกรมทั่วไป" ToolTip="เลือกรายการและตรวจหาไฟล์ติดตั้งใหม่" Margin="0,0,8,3"/>
+                  <Button Name="ChoosePayload" MinHeight="34" Content="เลือกโฟลเดอร์ Payload" Margin="0,0,8,3" Visibility="Collapsed"/>
+                  <Button Name="AppUpdateButton" MinHeight="34" Content="ตรวจอัปเดตแอป" Margin="0,0,8,3" Visibility="Collapsed"/>
                   <Button Name="CheckPayload" MinHeight="34" Content="ตรวจ Payload" Margin="0,0,8,3"/>
                   <Button Name="ClearButton" Style="{StaticResource QuietButton}" MinHeight="34" Content="ล้าง" ToolTip="ล้างงานที่เลือก" AutomationProperties.Name="ล้างงานที่เลือก" Margin="0,0,0,3"/>
                 </WrapPanel>
@@ -551,9 +578,13 @@ $choices = [ordered]@{
                 <DockPanel>
                   <Button Name="RefreshInventory" DockPanel.Dock="Top" HorizontalAlignment="Left" Content="ตรวจรายการใหม่"/>
                   <TextBlock Name="InventorySummary" DockPanel.Dock="Top" Margin="0,8" Text="ยังไม่ได้ตรวจโปรแกรม" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
-                  <ScrollViewer Name="PayloadReportPane" DockPanel.Dock="Top" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
-                    <TextBlock Name="PayloadReport" TextWrapping="Wrap" Margin="0,0,12,0"/>
-                  </ScrollViewer>
+                  <Grid>
+                  <Border Name="PayloadReportPane" Visibility="Collapsed">
+                    <TextBox Name="PayloadReport" IsReadOnly="True" TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto" Background="{DynamicResource SurfaceBrush}"
+                             Foreground="{DynamicResource TextBrush}" BorderThickness="0"
+                             AutomationProperties.Name="ผลตรวจไฟล์ Payload"/>
+                  </Border>
                   <ListBox Name="InventoryList" AutomationProperties.Name="สถานะโปรแกรม" BorderThickness="0"
                            Background="Transparent" Foreground="{DynamicResource TextBrush}"
                            ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.CanContentScroll="True" HorizontalContentAlignment="Stretch">
@@ -576,6 +607,7 @@ $choices = [ordered]@{
                       </DataTemplate>
                     </ListBox.ItemTemplate>
                   </ListBox>
+                  </Grid>
                 </DockPanel>
               </TabItem>
               <TabItem Header="แอนติไวรัส">
@@ -642,14 +674,32 @@ if ($taskbarResult -lt 0) { [Runtime.InteropServices.Marshal]::ThrowExceptionFor
 
 $Window = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xaml))
 $Window.Title = $windowTitle
+if ($HostedExe) {
+    foreach ($entry in @{
+        CanvasBrush = '#EEF2FA'; SurfaceBrush = '#FFFFFF'; TextBrush = '#17203B'
+        MutedBrush = '#415373'; DisabledTextBrush = '#586681'; LineBrush = '#D9E1F2'
+        AccentBrush = '#3448CB'; OnAccentBrush = '#FFFFFF'; SoftBrush = '#E3E9FF'
+        ConsoleBrush = '#E8EDFA'; ConsoleTextBrush = '#17203B'; HeroBrush = '#E1E7FE'
+    }.GetEnumerator()) {
+        $Window.Resources[$entry.Key] = [Windows.Media.BrushConverter]::new().ConvertFromString($entry.Value)
+    }
+}
 $brandAssets = Join-Path $Root 'assets'
-$Window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([uri](Join-Path $brandAssets 'app.ico'))
-$Window.FindName('AppLogo').ImageSource = [Windows.Media.Imaging.BitmapFrame]::Create([uri](Join-Path $brandAssets 'app-logo.png'))
+$brandImages = foreach ($name in 'app.ico','app-logo.png') {
+    $imageStream = [IO.File]::OpenRead((Join-Path $brandAssets $name))
+    try { [Windows.Media.Imaging.BitmapFrame]::Create($imageStream, 'None', 'OnLoad') }
+    finally { $imageStream.Dispose() }
+}
+$Window.Icon = $brandImages[0]
+$Window.FindName('AppLogo').ImageSource = $brandImages[1]
 $controls = @{}
 foreach ($name in 'StartButton','CancelButton','RestartButton','LogsButton','Options','Progress','Status','LogBox','ProgressLabel','SelectionCount','QuickActions','AppsOnlyButton','ClearButton','InventorySummary','InventoryList','RefreshInventory','SpecsText','SpecsDetails','LicenseSummary','RefreshLicense','OfficeLicenseSummary','InstallOffice','ActivationSettings','ActivateMas','ScanDrivers','DriverSummary','MissingDrivers','AvailableDrivers','DrawerColumn','DetailsDrawer','DetailsTabs','DrawerTitle','CloseDrawer','SpecsNav','LicenseNav','DriversNav','ProgramsNav','AntivirusNav','RefreshAntivirus','OpenWindowsSecurity','AntivirusSummary','AntivirusDetails','LogNav') {
     $controls[$name] = $Window.FindName($name)
 }
 $controls.CheckPayload = $Window.FindName('CheckPayload')
+$controls.ChoosePayload = $Window.FindName('ChoosePayload')
+$controls.AppUpdateButton = $Window.FindName('AppUpdateButton')
+if ($canUpdateApp) { $controls.AppUpdateButton.Visibility = 'Visible' }
 $controls.PayloadReportPane = $Window.FindName('PayloadReportPane')
 $controls.SkipInstallerButton = $Window.FindName('SkipInstallerButton')
 $controls.RetryAppsButton = $Window.FindName('RetryAppsButton')
@@ -660,7 +710,6 @@ $controls.OpenOfficeTool = $Window.FindName('OpenOfficeTool')
 $controls.AntivirusAlert = $Window.FindName('AntivirusAlert')
 $controls.AntivirusAlertText = $Window.FindName('AntivirusAlertText')
 $controls.Extras = $Window.FindName('Extras')
-$officeToolPath = Join-Path $Root 'payloads\Office Tool\Office Tool Plus.exe'
 # ใช้สีระบบเมื่อ Windows เปิดโหมด High Contrast
 if ([Windows.SystemParameters]::HighContrast) {
     foreach ($entry in @{
@@ -789,7 +838,7 @@ function Update-SelectionSummary {
     $controls.StartButton.IsEnabled = $count -gt 0 -and -not $ui.Handle -and -not $ui.Reboot
 }
 function Update-PayloadTaskVisibility {
-    $payload = Join-Path $Root 'payloads'
+    $payload = $PayloadRoot
     $folders = $PayloadFolders + @{ Disk = 'ใส่ให้ลูกค้า'; Fonts = '++Front' }
     foreach ($key in $folders.Keys) {
         $checks[$key].Visibility = if (Test-Path -LiteralPath (Join-Path $payload $folders[$key]) -PathType Container) {
@@ -804,7 +853,7 @@ function Update-PayloadTaskVisibility {
     $controls.OpenOfficeInstaller.Visibility = if (Test-Path -LiteralPath (Join-Path $payload 'OfficeInstaller++') -PathType Container) {
         'Visible'
     } else { 'Collapsed' }
-    $controls.OpenOfficeTool.Visibility = if (Test-Path -LiteralPath $officeToolPath -PathType Leaf) {
+    $controls.OpenOfficeTool.Visibility = if (Test-Path -LiteralPath (Join-Path $PayloadRoot 'Office Tool\Office Tool Plus.exe') -PathType Leaf) {
         'Visible'
     } else { 'Collapsed' }
     $controls.Extras.Visibility = if (@($controls.ActivateMas, $controls.OpenOfficeInstaller, $controls.OpenOfficeTool) |
@@ -822,7 +871,7 @@ foreach ($box in $checks.Values) {
 function Edit-AppSelection([switch]$AppsOnly) {
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
     try {
-        $updated = Show-AppSelection $Window (Join-Path $Root 'payloads\Apps') $configPath $Config
+        $updated = Show-AppSelection $Window (Join-Path $PayloadRoot 'Apps') $configPath $Config
         if (-not $updated) { return }
         $Config.Packages.Apps = $updated.Packages.Apps
         Update-PayloadTaskVisibility
@@ -846,7 +895,7 @@ Update-PayloadTaskVisibility
 $events = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 # ส่งสถานะผ่านคิว กิจกรรมที่ใช้เวลานานอยู่ใน Runspace นี้ทั้งหมด
 $worker = {
-    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures, $BuildVersion, $ChangeSmbSigning, $RetryApps)
+    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures, $BuildVersion, $ChangeSmbSigning, $RetryApps, $PayloadRoot, $HostedExe)
     $ErrorActionPreference = 'Stop'
     function Publish($Kind, $Value) { $Events.Enqueue(@{ Kind = $Kind; Value = $Value }) }
     function Write-Log([string]$Message) {
@@ -1014,6 +1063,15 @@ $worker = {
         Publish Inventory @(Get-PackageInventory)
         return
     }
+    if ($WorkerMode -in 'AppUpdateCheck','AppUpdateDownload') {
+        . (Join-Path $Root 'modules\09-AppUpdate.ps1')
+        if ($WorkerMode -eq 'AppUpdateCheck') {
+            Publish AppUpdateFound (Get-AppUpdate $BuildVersion)
+        } else {
+            Publish AppUpdateReady (Receive-AppUpdate @Selected)
+        }
+        return
+    }
     if ($WorkerMode -eq 'UpdateScan') {
         . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
         try {
@@ -1147,7 +1205,8 @@ $worker = {
         if ($script:DriverRestartRequired -or $script:UpdateRestartPending) { Publish Reboot $false }
         Write-Log ("ผิดพลาดในงาน {0}: {1} (HRESULT {2:X8})" -f $key,$_.Exception.Message,$_.Exception.HResult)
         if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace }
-        Publish Status 'หยุดเนื่องจากข้อผิดพลาด ดูรายละเอียดใน Log'
+        if ($key -eq 'Disk') { Publish Status "งานไดรฟ์ D: หยุดแล้ว · $($_.Exception.Message)" }
+        else { Publish Status 'หยุดเนื่องจากข้อผิดพลาด ดูรายละเอียดใน Log' }
     } finally {
         if ($Selected -contains 'Apps') { Publish AppFailures @($appFailures.Keys) }
     }
@@ -1176,11 +1235,12 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0, [
         AddArgument($ResumeTask).AddArgument($events).AddArgument($ui.Token.Token).AddArgument($Selected).
         AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock).
         AddArgument($updatesForWork).AddArgument($processedForWork).AddArgument($failuresForWork).
-        AddArgument($BuildVersion).AddArgument($ChangeSmbSigning).AddArgument($RetryApps)
+        AddArgument($BuildVersion).AddArgument($ChangeSmbSigning).AddArgument($RetryApps).AddArgument($PayloadRoot).AddArgument($HostedExe)
     $ui.Handle = $ui.Work.BeginInvoke()
     $poll.Start()
 }
 function Set-Busy([bool]$Busy) {
+    $controls.AppUpdateButton.IsEnabled = -not $Busy -and -not $ui.Reboot -and -not $ui.Resume
     $controls.RetryAppsButton.IsEnabled = -not $Busy -and -not $ui.Reboot -and -not $ui.Resume
     if ($Busy) { $controls.StartButton.IsEnabled = $false } else { Update-SelectionSummary }
     $controls.RestartButton.IsEnabled = -not $Busy
@@ -1226,6 +1286,27 @@ function Set-UpdateSummary([string]$Message, [switch]$Waiting) {
     Show-UpdateTiming
 }
 $poll = [Windows.Threading.DispatcherTimer]::new()
+$ui.AppUpdateCheckOnStart = $canUpdateApp -and -not $resume
+$controls.AppUpdateButton.Add_Click({
+    if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
+    if ($ui.AppUpdate -and $isGitCheckout) {
+        $answer = [Windows.MessageBox]::Show($Window,
+            'การติดตั้งจะแทนไฟล์แอปในโฟลเดอร์ Git นี้ งานที่ยังไม่ได้ commit อาจถูกเขียนทับ ต้องการติดตั้งหรือไม่?',
+            'ติดตั้งอัปเดตแอป', 'YesNo', 'Warning', 'No')
+        if ($answer -ne 'Yes') { return }
+    }
+    Set-Busy $true
+    $controls.CancelButton.IsEnabled = $false
+    if ($ui.AppUpdate) {
+        $controls.Status.Text = 'กำลังดาวน์โหลดอัปเดตแอป…'
+        $release = $ui.AppUpdate
+        Start-Work 'AppUpdateDownload' @($release.Version, $release.Tag, $release.Digest, $release.Size)
+    } else {
+        $ui.AppUpdateCheckManual = $true
+        $controls.Status.Text = 'กำลังตรวจอัปเดตแอป…'
+        Start-Work 'AppUpdateCheck' @()
+    }
+})
 $poll.Interval = [TimeSpan]::FromMilliseconds(150)
 $poll.Add_Tick({
     # อัปเดตหน้าต่างผ่าน Dispatcher หลังรับข้อมูลจาก Runspace
@@ -1233,6 +1314,15 @@ $poll.Add_Tick({
         $eventItem = $null
         while ($events.TryDequeue([ref]$eventItem)) {
             switch ($eventItem.Kind) {
+                AppUpdateFound {
+                    $ui.AppUpdate = $eventItem.Value
+                    $controls.AppUpdateButton.Content = if ($ui.AppUpdate) { 'ติดตั้งอัปเดตแอป' } else { 'ตรวจอัปเดตแอป' }
+                    $controls.AppUpdateButton.ToolTip = if ($ui.AppUpdate) { $ui.AppUpdate.Version }
+                    if ($ui.AppUpdateCheckManual) {
+                        $controls.Status.Text = if ($ui.AppUpdate) { "พบแอปรุ่นใหม่ $($ui.AppUpdate.Version)" } else { 'แอปเป็นรุ่นล่าสุดแล้ว' }
+                    }
+                }
+                AppUpdateReady { $ui.AppUpdateFiles = $eventItem.Value }
                 Log {
                     $ui.LastLogAt = [DateTime]::UtcNow
                     $followLog = ($controls.LogBox.ExtentHeight - $controls.LogBox.ViewportHeight - $controls.LogBox.VerticalOffset) -le 1
@@ -1408,6 +1498,12 @@ $poll.Add_Tick({
                     $ui.OfficeLicense = $null
                     $controls.OfficeLicenseSummary.Text = 'ตรวจสถานะ Office ไม่สำเร็จ กดตรวจใหม่เพื่อลองอีกครั้ง'
                 }
+                elseif ($ui.Mode -in 'AppUpdateCheck','AppUpdateDownload') {
+                    $controls.AppUpdateButton.ToolTip = $_.Exception.Message
+                    if ($ui.AppUpdateCheckManual -or $ui.Mode -eq 'AppUpdateDownload') {
+                        $controls.Status.Text = "อัปเดตแอปไม่สำเร็จ: $($_.Exception.Message)"
+                    }
+                }
                 else {
                     if ($ui.UpdateProgressClock) { Set-UpdateSummary 'งาน Windows Update หยุด ดูรายละเอียดใน Log' }
                     $ui.StatusBeforeWait = $null
@@ -1427,6 +1523,14 @@ $poll.Add_Tick({
             $controls.Progress.IsIndeterminate = $false
             $controls.ProgressLabel.Text = '{0:0}%' -f $controls.Progress.Value
             Set-Busy $false
+            if ($ui.AppUpdateFiles) { $Window.Close(); return }
+            if ($ui.Mode -eq 'Inventory' -and $ui.AppUpdateCheckOnStart -and -not $ui.Reboot) {
+                $ui.AppUpdateCheckOnStart = $false
+                Set-Busy $true
+                $controls.CancelButton.IsEnabled = $false
+                Start-Work 'AppUpdateCheck' @()
+                return
+            }
             if ($ui.Reboot) {
                 $controls.StartButton.IsEnabled = $false
                 $controls.Options.IsEnabled = $false
@@ -1452,6 +1556,21 @@ function Start-InventoryScan {
     Start-Work 'Inventory' @()
 }
 $controls.RefreshInventory.Add_Click({ Start-InventoryScan })
+if ($HostedExe) {
+    $controls.ChoosePayload.Visibility = 'Visible'
+    $controls.ChoosePayload.Add_Click({
+        Add-Type -AssemblyName System.Windows.Forms
+        $dialog = [Windows.Forms.FolderBrowserDialog]::new()
+        try {
+            $dialog.Description = 'เลือกโฟลเดอร์ที่มี Apps, Runtimes หรือ Office'
+            if (Test-Path -LiteralPath $PayloadRoot -PathType Container) { $dialog.SelectedPath = $PayloadRoot }
+            if ($dialog.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {
+                $script:PayloadRoot = $dialog.SelectedPath
+                $controls.CheckPayload.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            }
+        } finally { $dialog.Dispose() }
+    })
+}
 $controls.CheckPayload.Add_Click({
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
     Show-DetailsDrawer $controls.ProgramsNav
@@ -1478,7 +1597,7 @@ $controls.ActivationSettings.Add_Click({
 })
 $controls.ActivateMas.Add_Click({
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
-    $masFolder = Join-Path $Root 'payloads\MASMAX'
+    $masFolder = Join-Path $PayloadRoot 'MASMAX'
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $masFolder 'MAS_AIO.cmd') -PathType Leaf)) {
             throw 'ไม่พบไฟล์ payloads\MASMAX\MAS_AIO.cmd'
@@ -1489,7 +1608,7 @@ $controls.ActivateMas.Add_Click({
     }
 })
 $controls.OpenOfficeInstaller.Add_Click({
-    $installerFolder = Join-Path $Root 'payloads\OfficeInstaller++'
+    $installerFolder = Join-Path $PayloadRoot 'OfficeInstaller++'
     $installerName = if ([Environment]::Is64BitOperatingSystem) {
         'Office Installer+ x64.exe'
     } else {
@@ -1502,6 +1621,7 @@ $controls.OpenOfficeInstaller.Add_Click({
     }
 })
 $controls.OpenOfficeTool.Add_Click({
+    $officeToolPath = Join-Path $PayloadRoot 'Office Tool\Office Tool Plus.exe'
     if ($ui.Handle -or $ui.Reboot -or $ui.Resume) { return }
     try {
         Start-Process -FilePath $officeToolPath -WorkingDirectory (Split-Path -LiteralPath $officeToolPath) -ErrorAction Stop
@@ -1538,7 +1658,7 @@ function Show-PartitionDialog {
         Background="{DynamicResource CanvasBrush}" Foreground="{DynamicResource TextBrush}">
   <StackPanel Margin="24">
     <TextBlock Text="พื้นที่จัดเก็บ" Style="{DynamicResource Eyebrow}"/>
-    <TextBlock Text="แบ่งพื้นที่ Windows และ Data" FontSize="24" FontWeight="SemiBold" Margin="0,4,0,0"/>
+    <TextBlock Text="แบ่งพื้นที่ Windows และ Data (D:)" FontSize="24" FontWeight="SemiBold" Margin="0,4,0,0"/>
     <TextBlock Text="เลือกเปอร์เซ็นต์ Data จากช่วงพื้นที่ต่อเนื่องที่แบ่งได้บนดิสก์ Windows" Margin="0,8,0,16" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
     <Border Style="{DynamicResource Card}" Background="{DynamicResource SoftBrush}">
       <StackPanel>
@@ -1547,7 +1667,7 @@ function Show-PartitionDialog {
                 LargeChange="10" Margin="0,12,0,0" AutomationProperties.Name="เปอร์เซ็นต์ Data"/>
       </StackPanel>
     </Border>
-    <TextBlock Text="สำรองข้อมูลก่อนดำเนินการ แอปจะตรวจสัดส่วนที่ Windows อนุญาตก่อนย่อ หากมี Volume Data อยู่แล้วบนดิสก์ Windows จะใช้ Volume เดิมโดยไม่แบ่งใหม่" Margin="0,12,0,18" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
+    <TextBlock Text="สำรองข้อมูลก่อนดำเนินการ แอปจะตรวจขนาดที่ Windows อนุญาตให้ย่อ และสร้าง Data เป็น D: บนดิสก์ Windows เท่านั้น" Margin="0,12,0,18" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
       <Button Content="ยกเลิก" Style="{DynamicResource QuietButton}" IsCancel="True" Margin="0,0,8,0"/>
       <Button Name="ConfirmSplit" Content="ยืนยันสัดส่วน" Style="{DynamicResource PrimaryButton}"/>
@@ -1569,7 +1689,7 @@ function Show-PartitionDialog {
     if ($dialog.ShowDialog() -eq $true) { return [int]$slider.Value }
 }
 
-function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
+function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent, [switch]$UseExistingData) {
     . (Join-Path $Root 'modules\03-InstallAllAndFix.ps1')
     $programs = @(Get-InstalledProgramRecords)
     $plan = @(foreach ($key in $Selected) {
@@ -1580,8 +1700,10 @@ function Show-SetupQueue($Selected, $Hidden, [int]$DataPercent) {
         }
         if ($key -eq 'Disk') {
             if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'WaritAutoSetup\data-partition.json') -PathType Leaf) {
-                '  • ทำแผน Data ที่ค้างไว้ต่อ โดยใช้ขนาดที่บันทึกไว้'
-            } else { "  • สัดส่วน Data ที่ขอ $DataPercent%" }
+                '  • ทำแผน Data (D:) ที่ค้างไว้ต่อ โดยใช้ขนาดที่บันทึกไว้'
+            } elseif ($UseExistingData) {
+                '  • คัดลอกไฟล์ไปยัง Data (D:) เดิม'
+            } else { "  • สัดส่วน Data (D:) ที่ขอ $DataPercent%" }
         }
         if ($key -eq 'SMB1') { '  • SMB 1.0 เป็นโปรโตคอลเก่า ควรเปิดเมื่อจำเป็นสำหรับอุปกรณ์รุ่นเก่า' }
         if ($key -in 'Apps','Runtimes','LINE','Office','Foxit','ACDSee') {
@@ -1663,12 +1785,32 @@ function Start-SelectedSetup([switch]$OfficeOnly, [switch]$UpdateOnly) {
         return
     }
     $dataPercent = 0
+    $useExistingData = $false
     if ($selected -contains 'Disk') {
         $dataPlan = Join-Path $env:ProgramData 'WaritAutoSetup\data-partition.json'
-        $dataPercent = if (Test-Path -LiteralPath $dataPlan -PathType Leaf) { 50 } else { Show-PartitionDialog }
-        if ($null -eq $dataPercent) { return }
+        $hasDataPlan = Test-Path -LiteralPath $dataPlan -PathType Leaf
+        try {
+            . (Join-Path $Root 'modules\01-DiskAndData.ps1')
+            $osPartition = Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))
+            $dataDrive = Get-WindowsDataDrive $osPartition
+            if ($dataDrive -and -not $hasDataPlan) {
+                $volume = $dataDrive | Get-Volume -ErrorAction Stop
+                if ($volume.FileSystemLabel -ne 'Data') {
+                    throw 'D: ถูกใช้งานอยู่โดยพาร์ติชันที่ไม่ได้ชื่อ Data กรุณาตรวจ Disk Management'
+                }
+                $useExistingData = $true
+            }
+        } catch {
+            $controls.Status.Text = $_.Exception.Message
+            [void][Windows.MessageBox]::Show($Window, $_.Exception.Message, 'แบ่งไดรฟ์ D:', 'OK', 'Warning')
+            return
+        }
+        if (-not ($useExistingData -or $hasDataPlan)) {
+            $dataPercent = Show-PartitionDialog
+            if ($null -eq $dataPercent) { return }
+        }
     }
-    if (-not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent)) { return }
+    if (-not $ui.Resume -and -not (Show-SetupQueue $selected $hidden $dataPercent -UseExistingData:$useExistingData)) { return }
     $changeSmbSigning = $false
     if ($selected -contains 'Printer') {
         $answer = [Windows.MessageBox]::Show($Window,
@@ -1808,11 +1950,22 @@ $Window.Add_Closed({
     $antivirusPoll.Stop()
 })
 [void]$Window.ShowDialog()
+if ($ui.AppUpdateFiles) {
+    . (Join-Path $Root 'modules\09-AppUpdate.ps1')
+    Install-AppUpdate $Root $ui.AppUpdateFiles
+    $relaunchUpdatedApp = $true
+}
 } catch {
+    if ($HostedExe) { throw }
     [void][Windows.MessageBox]::Show($_.Exception.Message, 'Windows Auto Setup', 'OK', 'Error')
     exit 1
 } finally {
     $mutex.ReleaseMutex()
     $mutex.Dispose()
     if ($antivirusScan -and $antivirusScan.Work) { $antivirusScan.Work.Dispose() }
+}
+if ($relaunchUpdatedApp) {
+    $arguments = '-NoProfile -STA -ExecutionPolicy Bypass -File "{0}" -PayloadRoot "{1}" -DataRoot "{2}"' -f
+        $PSCommandPath, (Join-Path $PayloadRoot '.'), (Join-Path $DataRoot '.')
+    Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden
 }
