@@ -18,6 +18,72 @@
     }
 }
 
+function Get-SilentArgumentPresets([string]$FileName) {
+    $catalog = @(
+        @{ Name='7-Zip'; Flags='/S'; Pattern='^7z\d'; Detail='ใช้กับตัวติดตั้ง EXE ของ 7-Zip ใช้ /S ตัวพิมพ์ใหญ่เพื่อติดตั้งเงียบ' }
+        @{ Name='Chrome Standalone'; Flags='/silent /install'; Pattern='^ChromeStandalone'; Detail='ใช้กับ Google Chrome Standalone EXE แบบไฟล์เต็ม เพื่อติดตั้งเงียบ' }
+        @{ Name='Notepad++'; Flags='/S'; Pattern='^(npp[._-]|notepad\+\+)'; Detail='ใช้กับตัวติดตั้ง EXE ของ Notepad++ ใช้ /S ตัวพิมพ์ใหญ่' }
+        @{ Name='VLC'; Flags='/S'; Pattern='^vlc[-_.]'; Detail='ใช้กับตัวติดตั้ง Windows EXE ของ VLC จาก VideoLAN' }
+        @{ Name='WinRAR'; Flags='/S'; Pattern='^(winrar|wrar)'; Detail='ใช้กับตัวติดตั้ง WinRAR EXE เพื่อติดตั้งเงียบ' }
+        @{ Name='Visual C++ Redistributable'; Flags='/install /quiet /norestart'; Pattern='^vc[_.-]?redist'; Detail='ใช้กับ VC_redist.x64.exe หรือ x86 เพื่อติดตั้งเงียบและระงับการรีสตาร์ทอัตโนมัติ' }
+        @{ Name='Microsoft Edge WebView2 Runtime'; Flags='/silent /install'; Pattern='^MicrosoftEdgeWebView2RuntimeInstaller'; Detail='ใช้กับตัวติดตั้ง WebView2 Runtime แบบ Evergreen EXE' }
+        @{ Name='AIMP'; Flags='/AUTO /SILENT'; Pattern='^aimp'; Detail='ใช้กับตัวติดตั้ง AIMP EXE เพื่อเลือกค่าตั้งต้นและติดตั้งเงียบ' }
+        @{ Name='PhotoScape 3.7'; Flags='/S'; Pattern='^PhotoScapeSetup_V3[-.]7'; Detail='ใช้กับตัวติดตั้ง PhotoScape 3.7 เช่น PhotoScapeSetup_V3-7.exe' }
+        @{ Name='Inno Setup'; Flags='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'; Detail='ใช้กับ EXE ที่ผู้ผลิตยืนยันว่าใช้ Inno Setup เช่น Revo Uninstaller Free รุ่นที่ใช้ตัวติดตั้งนี้' }
+        @{ Name='NSIS'; Flags='/S'; Detail='ใช้กับ EXE ที่ผู้ผลิตยืนยันว่าใช้ NSIS เช่น Notepad++ ตัวพิมพ์ใหญ่ของ /S มีผล' }
+    )
+    $items = foreach ($preset in $catalog) {
+        $matched = $preset.Pattern -and $FileName -match $preset.Pattern
+        [pscustomobject]@{
+            Label = if ($matched) { "$($preset.Name) (ชื่อไฟล์ตรง)" } else { $preset.Name }
+            Flags = $preset.Flags; Detail = $preset.Detail; Matched = $matched
+        }
+    }
+    $items | Where-Object Matched
+    $items | Where-Object { -not $_.Matched }
+}
+
+function Show-SilentArgumentHelper($Owner, $File, $ArgumentBox) {
+    [xml]$layout = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="แนะนำพารามิเตอร์ Silent" Width="530" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" FontFamily="Segoe UI" FontSize="14"
+        Background="{DynamicResource SurfaceBrush}" Foreground="{DynamicResource TextBrush}">
+  <StackPanel Margin="20">
+    <TextBlock Name="InstallerName" FontWeight="SemiBold" TextWrapping="Wrap"/>
+    <TextBlock Text="เลือกตามแอปหรือชนิดตัวติดตั้ง และตรวจคู่มือของรุ่นที่ใช้ก่อน" TextWrapping="Wrap" Margin="0,8"/>
+    <ComboBox Name="Preset" DisplayMemberPath="Label" MaxDropDownHeight="270" AutomationProperties.Name="แอปหรือชนิดตัวติดตั้ง"/>
+    <TextBlock Name="Flags" Margin="0,12,0,4" FontFamily="Consolas" FontWeight="SemiBold" TextWrapping="Wrap"/>
+    <TextBlock Name="Description" MinHeight="48" TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button Content="ยกเลิก" IsCancel="True" Margin="0,0,8,0"/>
+      <Button Name="UsePreset" Content="ใช้พารามิเตอร์นี้" IsEnabled="False" IsDefault="True"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+    $dialog = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($layout))
+    $dialog.Owner = $Owner
+    $dialog.Icon = $Owner.Icon
+    $dialog.Resources.MergedDictionaries.Add($Owner.Resources)
+    $dialog.FindName('InstallerName').Text = if ($File) { $File.Name } else { 'ดูพารามิเตอร์ก่อนเลือกไฟล์ EXE' }
+    $picker = $dialog.FindName('Preset')
+    $flags = $dialog.FindName('Flags')
+    $description = $dialog.FindName('Description')
+    $use = $dialog.FindName('UsePreset')
+    $picker.ItemsSource = @(Get-SilentArgumentPresets $File.Name)
+    $picker.Add_SelectionChanged({
+        $preset = $picker.SelectedItem
+        $flags.Text = [string]$preset.Flags
+        $description.Text = [string]$preset.Detail
+        $use.IsEnabled = $null -ne $preset
+    })
+    if ($picker.Items[0].Matched) { $picker.SelectedIndex = 0 }
+    $use.Add_Click({ $dialog.DialogResult = $true })
+    if ($dialog.ShowDialog() -eq $true) { $ArgumentBox.Text = $picker.SelectedItem.Flags }
+}
+
 function Show-AppRecipeEditor($Owner) {
     [xml]$layout = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -91,7 +157,10 @@ function Show-AppRecipeEditor($Owner) {
               </StackPanel>
               <StackPanel Grid.Column="1">
                 <TextBlock Text="พารามิเตอร์ตัวติดตั้ง" Margin="0,0,0,4"/>
-                <TextBox Name="Arguments" AutomationProperties.Name="พารามิเตอร์ตัวติดตั้ง"/>
+                <DockPanel>
+                  <Button Name="SuggestMain" DockPanel.Dock="Right" Content="แนะนำพารามิเตอร์…" Margin="8,0,0,0"/>
+                  <TextBox Name="Arguments" AutomationProperties.Name="พารามิเตอร์ตัวติดตั้ง"/>
+                </DockPanel>
               </StackPanel>
             </Grid>
             <TextBlock Name="ModeHint" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
@@ -116,6 +185,7 @@ function Show-AppRecipeEditor($Owner) {
             <StackPanel Name="StepOptions" Margin="0,8,0,0" Visibility="Collapsed">
               <TextBlock Text="พารามิเตอร์ขั้นตอนที่เลือก (Silent EXE ต้องระบุ)" Margin="0,0,0,4"/>
               <TextBox Name="StepArguments" AutomationProperties.Name="พารามิเตอร์ขั้นตอนที่เลือก"/>
+              <Button Name="SuggestStep" Content="แนะนำพารามิเตอร์…" HorizontalAlignment="Left" Margin="0,6,0,0" Visibility="Collapsed"/>
             </StackPanel>
           </StackPanel>
         </Border>
@@ -129,8 +199,8 @@ function Show-AppRecipeEditor($Owner) {
     $editor.Icon = $Owner.Icon
     $editor.Resources.MergedDictionaries.Add($Owner.Resources)
     $fields = @{}
-    foreach ($id in 'RecipeName','RecipeCategory','DetectName','Reinstall','Mode','CmdMode','Arguments','ModeHint','MainPath',
-        'ChooseMain','AddBefore','AddStep','StepList','StepOptions','StepArguments','MoveUp','MoveDown','RemoveStep','SaveRecipe','Problem') {
+    foreach ($id in 'RecipeName','RecipeCategory','DetectName','Reinstall','Mode','CmdMode','Arguments','ModeHint','MainPath','SuggestMain',
+        'ChooseMain','AddBefore','AddStep','StepList','StepOptions','StepArguments','SuggestStep','MoveUp','MoveDown','RemoveStep','SaveRecipe','Problem') {
         $fields[$id] = $editor.FindName($id)
     }
     $steps = [Collections.Generic.List[object]]::new()
@@ -145,6 +215,7 @@ function Show-AppRecipeEditor($Owner) {
         $fields.RemoveStep.IsEnabled = $index -ge 0 -and -not $steps[$index].Main
         $editArguments = $index -ge 0 -and -not $steps[$index].Main -and $steps[$index].File.Extension -ne '.reg'
         $fields.StepOptions.Visibility = if ($editArguments) { 'Visible' } else { 'Collapsed' }
+        $fields.SuggestStep.Visibility = if ($editArguments -and $steps[$index].File.Extension -eq '.exe') { 'Visible' } else { 'Collapsed' }
         if ($editArguments) { $fields.StepArguments.Text = [string]$steps[$index].Arguments }
     }
 
@@ -175,6 +246,8 @@ function Show-AppRecipeEditor($Owner) {
     }
 
     function Update-RecipeMode {
+        $fields.SuggestMain.Visibility = if ($fields.Mode.SelectedIndex -eq 0 -and
+            (-not $main.File -or $main.File.Extension -eq '.exe')) { 'Visible' } else { 'Collapsed' }
         $fields.ModeHint.Text = if ($fields.Mode.SelectedIndex -eq 1) { 'ใส่พารามิเตอร์ที่ไฟล์หลักต้องใช้เมื่อรันผ่าน CMD' }
             elseif ($fields.Mode.SelectedIndex -eq 2) { 'เปิดหน้าต่างตัวติดตั้งให้ทำตามขั้นตอน' }
             elseif ($main.File.Extension -eq '.msi') { 'MSI จะใช้ /qn /norestart อัตโนมัติ' }
@@ -190,6 +263,10 @@ function Show-AppRecipeEditor($Owner) {
         }
     })
     $fields.Mode.Add_SelectionChanged({ Update-RecipeMode })
+    $fields.SuggestMain.Add_Click({ Show-SilentArgumentHelper $editor $main.File $fields.Arguments })
+    $fields.SuggestStep.Add_Click({
+        Show-SilentArgumentHelper $editor $steps[$fields.StepList.SelectedIndex].File $fields.StepArguments
+    })
     $fields.ChooseMain.Add_Click({
         try {
             $file = Select-RecipeFile 'ตัวติดตั้ง (*.exe;*.msi;*.cmd;*.bat)|*.exe;*.msi;*.cmd;*.bat'
@@ -198,9 +275,9 @@ function Show-AppRecipeEditor($Owner) {
             if (-not $fields.RecipeName.Text.Trim() -or $fields.RecipeName.Text -eq $main.File.BaseName) {
                 $fields.RecipeName.Text = $file.BaseName
             }
+            if ($main.File -or $file.Extension -ne '.exe') { $fields.Arguments.Clear() }
             $main.File = $file
             $fields.MainPath.Text = $file.FullName
-            $fields.Arguments.Clear()
             $fields.Mode.SelectedIndex = [int]($file.Extension -in '.cmd','.bat')
             $fields.CmdMode.IsEnabled = $file.Extension -ne '.msi'
             $fields.Mode.IsEnabled = $file.Extension -in '.exe','.msi'
@@ -466,6 +543,16 @@ function Show-AppSelection($Owner, [string]$AppsPath, [string]$ConfigPath, $Conf
                 $arguments = [Windows.Controls.TextBox]::new()
                 [Windows.Automation.AutomationProperties]::SetName($arguments, $hint.Text)
                 [void]$settings.Children.Add($arguments)
+                $suggest = [Windows.Controls.Button]::new()
+                $suggest.Content = 'แนะนำพารามิเตอร์…'
+                $suggest.HorizontalAlignment = 'Left'
+                $suggest.Margin = [Windows.Thickness]::new(0, 6, 0, 0)
+                $suggest.Tag = @{ Owner = $dialog; File = $Candidate.File; TextBox = $arguments }
+                $suggest.Add_Click({
+                    param($sender, $eventArgs)
+                    Show-SilentArgumentHelper $sender.Tag.Owner $sender.Tag.File $sender.Tag.TextBox
+                })
+                [void]$settings.Children.Add($suggest)
             }
             $hint = [Windows.Controls.TextBlock]::new()
             $hint.Text = 'ชื่อใน Installed apps สำหรับตรวจว่าติดตั้งแล้ว (ถ้าเว้นว่างอาจรันซ้ำ)'

@@ -862,6 +862,7 @@ function Update-PayloadTaskVisibility {
 }
 $ui = @{
     Work = $null; Space = $null; Handle = $null; Token = $null; Mode = ''; Resume = $resume
+    CloseRequest = [hashtable]::Synchronized(@{ Requested = $false }); CloseForUpdate = $false
     UpdateRows = [ordered]@{}; UpdateManualTitles = @(); UpdatePreviewTitles = @()
 }
 foreach ($box in $checks.Values) {
@@ -895,7 +896,7 @@ Update-PayloadTaskVisibility
 $events = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 # ส่งสถานะผ่านคิว กิจกรรมที่ใช้เวลานานอยู่ใน Runspace นี้ทั้งหมด
 $worker = {
-    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures, $BuildVersion, $ChangeSmbSigning, $RetryApps, $PayloadRoot, $HostedExe)
+    param($Root, $Config, $PayloadFolders, $StatePath, $ResumeTask, $Events, $Cancel, $Selected, $LogPath, $WorkerMode, $DataPercent, $LogLock, $UpdateList, $ProcessedUpdateKeys, $UpdateFailures, $BuildVersion, $ChangeSmbSigning, $RetryApps, $PayloadRoot, $HostedExe, $CloseRequest)
     $ErrorActionPreference = 'Stop'
     function Publish($Kind, $Value) { $Events.Enqueue(@{ Kind = $Kind; Value = $Value }) }
     function Write-Log([string]$Message) {
@@ -981,9 +982,10 @@ $worker = {
                     Start-Sleep -Milliseconds 10
                     continue
                 }
-                if ($skip.Requested -or $timer.Elapsed.TotalSeconds -ge $Timeout) {
+                $closing = $CloseRequest.Requested -and -not $IgnoreCancellation
+                if ($closing -or $skip.Requested -or $timer.Elapsed.TotalSeconds -ge $Timeout) {
                     $skipped = $skip.Requested
-                    $reason = if ($skipped) { 'ข้ามตามคำสั่งผู้ใช้' } else { 'หมดเวลารอ' }
+                    $reason = if ($closing) { 'ปิดแอป' } elseif ($skipped) { 'ข้ามตามคำสั่งผู้ใช้' } else { 'หมดเวลารอ' }
                     Write-Log "$reason | กำลังหยุด $name (PID $($process.Id))"
                     $kill = Start-Process "$env:SystemRoot\System32\taskkill.exe" -ArgumentList "/PID $($process.Id) /T /F" -WindowStyle Hidden -PassThru
                     try {
@@ -991,6 +993,7 @@ $worker = {
                             throw "$reason แต่ยังยืนยันการหยุดตัวติดตั้งไม่ได้: $File"
                         }
                     } finally { $kill.Dispose() }
+                    if ($closing) { throw [OperationCanceledException]::new('ปิดแอปตามคำสั่งผู้ใช้') }
                     if ($skipped) {
                         $failure = [InvalidOperationException]::new("ข้ามตัวติดตั้ง $File")
                         $failure.Data['InstallerSkipped'] = $true
@@ -1235,7 +1238,8 @@ function Start-Work([string]$Mode, [string[]]$Selected, [int]$DataPercent = 0, [
         AddArgument($ResumeTask).AddArgument($events).AddArgument($ui.Token.Token).AddArgument($Selected).
         AddArgument($log).AddArgument($Mode).AddArgument($DataPercent).AddArgument($ui.LogLock).
         AddArgument($updatesForWork).AddArgument($processedForWork).AddArgument($failuresForWork).
-        AddArgument($BuildVersion).AddArgument($ChangeSmbSigning).AddArgument($RetryApps).AddArgument($PayloadRoot).AddArgument($HostedExe)
+        AddArgument($BuildVersion).AddArgument($ChangeSmbSigning).AddArgument($RetryApps).AddArgument($PayloadRoot).
+        AddArgument($HostedExe).AddArgument($ui.CloseRequest)
     $ui.Handle = $ui.Work.BeginInvoke()
     $poll.Start()
 }
@@ -1520,10 +1524,15 @@ $poll.Add_Tick({
                 $ui.Token.Dispose()
                 $ui.Handle = $null
             }
+            if ($ui.CloseRequest.Requested) {
+                if (-not $ui.CloseForUpdate) { $ui.AppUpdateFiles = $null }
+                if (-not $antivirusScan.Work) { $Window.Close() }
+                return
+            }
             $controls.Progress.IsIndeterminate = $false
             $controls.ProgressLabel.Text = '{0:0}%' -f $controls.Progress.Value
             Set-Busy $false
-            if ($ui.AppUpdateFiles) { $Window.Close(); return }
+            if ($ui.AppUpdateFiles) { $ui.CloseForUpdate = $true; $Window.Close(); return }
             if ($ui.Mode -eq 'Inventory' -and $ui.AppUpdateCheckOnStart -and -not $ui.Reboot) {
                 $ui.AppUpdateCheckOnStart = $false
                 Set-Busy $true
@@ -1867,13 +1876,18 @@ $controls.RestartButton.Add_Click({
 })
 $Window.Add_Closing({
     param($sender, $e)
-    if ($ui.Handle) {
-        $e.Cancel = $true
-        $waitMessage = if ($controls.CancelButton.IsEnabled) {
-            'กด ยกเลิกงาน และรอให้งานปัจจุบันสิ้นสุดก่อนปิดหน้าต่าง'
-        } else { 'รอให้งานปัจจุบันสิ้นสุดก่อนปิดหน้าต่าง' }
-        Set-WaitStatus $waitMessage
+    if (-not $ui.Handle -and -not $antivirusScan.Work) { return }
+    $e.Cancel = $true
+    if ($ui.CloseRequest.Requested) { return }
+    $ui.CloseRequest.Requested = $true
+    $antivirusRefresh.Stop()
+    if ($ui.Handle) { $ui.Token.Cancel() }
+    if ($antivirusScan.Work -and -not $antivirusScan.Handle.IsCompleted) {
+        try { $antivirusScan.StopHandle = $antivirusScan.Work.BeginStop($null, $null) }
+        catch [System.Management.Automation.InvalidPowerShellStateException] { }
     }
+    $Window.IsEnabled = $false
+    Set-WaitStatus 'กำลังปิดแอปและหยุดงานเบื้องหลัง…'
 })
 
 if ($resume) {
@@ -1898,7 +1912,7 @@ function Update-AntivirusAlert($Results) {
 }
 
 function Start-AntivirusScan {
-    if ($antivirusScan.Work) { return }
+    if ($ui.CloseRequest.Requested -or $antivirusScan.Work) { return }
     $controls.RefreshAntivirus.IsEnabled = $false
     $controls.AntivirusSummary.Text = 'กำลังตรวจสถานะ…'
     $antivirusScan.Work = [PowerShell]::Create()
@@ -1915,9 +1929,11 @@ function Start-AntivirusScan {
 }
 
 $antivirusPoll.Add_Tick({
-    if (-not $antivirusScan.Handle.IsCompleted) { return }
+    if (-not $antivirusScan.Handle.IsCompleted -or
+        ($antivirusScan.StopHandle -and -not $antivirusScan.StopHandle.IsCompleted)) { return }
     $antivirusPoll.Stop()
     try {
+        if ($antivirusScan.StopHandle) { $antivirusScan.Work.EndStop($antivirusScan.StopHandle) }
         $result = @($antivirusScan.Work.EndInvoke($antivirusScan.Handle))
         if ($antivirusScan.Work.HadErrors -or $result.Count -eq 0) { throw 'Antivirus status unavailable' }
         $controls.AntivirusDetails.Text = ($result | ForEach-Object Detail) -join [Environment]::NewLine
@@ -1929,8 +1945,10 @@ $antivirusPoll.Add_Tick({
         $antivirusScan.Work.Dispose()
         $antivirusScan.Work = $null
         $antivirusScan.Handle = $null
+        $antivirusScan.StopHandle = $null
         $controls.RefreshAntivirus.IsEnabled = $true
     }
+    if ($ui.CloseRequest.Requested -and -not $ui.Handle) { $Window.Close() }
 })
 $controls.RefreshAntivirus.Add_Click({ Start-AntivirusScan })
 $antivirusRefresh.Add_Tick({ Start-AntivirusScan })
