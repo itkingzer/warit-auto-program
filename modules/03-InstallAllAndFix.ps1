@@ -19,11 +19,20 @@ function Get-InstalledProgramRecords {
 }
 
 function Find-InstalledProgram($Entry, $Programs) {
-    if ($Entry.DetectName) {
+    $match = if ($Entry.DetectName) {
         $Programs | Where-Object { $_.DisplayName -match $Entry.DetectName } | Select-Object -First 1
     }
     elseif ($Entry.Name) {
         $Programs | Where-Object DisplayName -eq $Entry.Name | Select-Object -First 1
+    }
+    if ($match) { return $match }
+    if ($Entry.Name -eq 'Adobe Photoshop CS6 Extended') {
+        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique) {
+            $path = Join-Path $root 'Adobe\Adobe Photoshop CS6\Photoshop.exe'
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                return [pscustomobject]@{ DisplayName = $Entry.Name; DisplayVersion = (Get-Item -LiteralPath $path).VersionInfo.ProductVersion }
+            }
+        }
     }
 }
 
@@ -31,18 +40,19 @@ function Get-LocalInstallerProblem($File, [string]$Group, $Entry) {
     if ($File.Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'ไม่รองรับไฟล์ลิงก์' }
     if ($File.Extension -notin '.exe','.msi','.cmd','.bat','.ps1','.reg') { return 'ไม่รองรับชนิดไฟล์' }
     if ($File.Length -eq 0) { return 'ไฟล์ติดตั้งว่างเปล่า' }
-    if ($Group -eq 'Apps' -and $File.Extension -eq '.exe' -and $Entry.InstallMode -ne 'Cmd' -and
+    if ($Group -eq 'Apps' -and $File.Extension -eq '.exe' -and $Entry.InstallMode -notin 'Cmd','Interactive' -and
         [string]::IsNullOrWhiteSpace($Entry.Arguments)) {
         return 'ยังไม่ได้กำหนดพารามิเตอร์ติดตั้งแบบเงียบ'
     }
 }
 
 function Resolve-AppRecipeSteps($Entry, $MainFile, [string]$Folder) {
-    if ($Entry.InstallMode -notin 'Silent','Cmd' -or
+    if ($Entry.InstallMode -notin 'Silent','Cmd','Interactive' -or
         @($Entry.Steps | Where-Object { $_.Main -eq $true }).Count -ne 1 -or
         [string]$Entry.Arguments -match '[\r\n]') {
         throw 'การตั้งค่าลำดับติดตั้งไม่ถูกต้อง'
     }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($step in $Entry.Steps) {
         $name = [string]$step.File
         if (-not $name -or $name -in '.','..' -or $name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
@@ -52,18 +62,25 @@ function Resolve-AppRecipeSteps($Entry, $MainFile, [string]$Folder) {
         if (-not $file -or $file.PSIsContainer -or (Get-LocalInstallerProblem $file '' $Entry)) {
             throw "ขาดไฟล์หรือไฟล์ใช้ไม่ได้: $name"
         }
+        if (-not $seen.Add($file.FullName)) { throw "ไฟล์ซ้ำในลำดับติดตั้ง: $name" }
+        $arguments = if ($step.Main -eq $true) { [string]$Entry.Arguments } else { [string]$step.Arguments }
+        if ($arguments -match '[\r\n]') { throw "พารามิเตอร์ต้องอยู่ในบรรทัดเดียว: $name" }
         $kind = if ($step.Main -eq $true) {
             if ($file.FullName -ne $MainFile.FullName -or
-                ($Entry.InstallMode -eq 'Silent' -and $file.Extension -notin '.exe','.msi') -or
+                ($Entry.InstallMode -in 'Silent','Interactive' -and $file.Extension -notin '.exe','.msi') -or
                 ($Entry.InstallMode -eq 'Cmd' -and $file.Extension -notin '.exe','.cmd','.bat')) {
                 throw "ชนิดไฟล์หลักไม่ตรงกับวิธีติดตั้ง: $name"
             }
             $Entry.InstallMode
         } elseif ($file.Extension -eq '.reg') { 'Registry' }
         elseif ($file.Extension -in '.cmd','.bat') { 'Cmd' }
+        elseif ($file.Extension -in '.exe','.msi') { 'Silent' }
         else { throw "ชนิดไฟล์ขั้นตอนเพิ่มเติมไม่ถูกต้อง: $name" }
+        if ($kind -eq 'Silent' -and $file.Extension -eq '.exe' -and [string]::IsNullOrWhiteSpace($arguments)) {
+            throw "ระบุพารามิเตอร์ Silent ของไฟล์ $name"
+        }
         if ($kind -eq 'Cmd' -and $file.FullName.Contains('%')) { throw "พาธสำหรับ CMD มีเครื่องหมาย %: $name" }
-        [pscustomobject]@{ File = $file; Kind = $kind; Main = $step.Main -eq $true }
+        [pscustomobject]@{ File = $file; Kind = $kind; Main = $step.Main -eq $true; Arguments = $arguments }
     }
 }
 
@@ -283,7 +300,7 @@ function Invoke-AppRecipe($Entry, [object[]]$Steps, [int]$Timeout, [string]$Fold
     foreach ($step in $Steps) {
         $index++
         $file = $step.File
-        $arguments = if ($step.Main) { [string]$Entry.Arguments } else { '' }
+        $arguments = $step.Arguments
         Write-Log "$name | ขั้นตอน $index/$($Steps.Count): $($file.Name) ($($step.Kind))"
         $run = @{ File = $file.FullName; Arguments = $arguments; Timeout = $Timeout
             SuccessCodes = @(0,3010,1641); WorkingDirectory = $Folder; PassExitCode = $true
@@ -298,10 +315,11 @@ function Invoke-AppRecipe($Entry, [object[]]$Steps, [int]$Timeout, [string]$Fold
                 $run.Arguments = 'import "{0}"' -f $file.FullName
                 $run.SuccessCodes = @(0)
             }
-            'Silent' {
+            { $_ -in 'Silent','Interactive' } {
                 if ($file.Extension -eq '.msi') {
                     $run.File = "$env:SystemRoot\System32\msiexec.exe"
-                    $run.Arguments = '/i "{0}" /qn /norestart {1}' -f $file.FullName, $arguments
+                    $flags = if ($step.Kind -eq 'Silent') { '/qn /norestart' } else { '/norestart' }
+                    $run.Arguments = '/i "{0}" {1} {2}' -f $file.FullName, $flags, $arguments
                 }
             }
         }
@@ -332,6 +350,7 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
     if ($RetryApps.Count) { $entries = @($entries | Where-Object Name -in $RetryApps) }
     if (-not $entries) { Write-Log "ข้าม $Group เนื่องจากไม่มีรายการที่เปิดใช้ใน config.json"; return }
     $programs = @(Get-InstalledProgramRecords)
+    $completedAppFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $chromeOffline = if ($Group -eq 'Apps') {
         $entries | Where-Object { $_.Name -eq 'Google Chrome' -and $_.File -eq 'ChromeStandaloneSetup64.exe' } | Select-Object -First 1
     }
@@ -380,6 +399,10 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
                 continue
             }
             $file = $files[0]
+            if ($Group -eq 'Apps' -and $completedAppFiles.Contains($file.FullName)) {
+                Write-Log "ข้าม $($entry.Name): ใช้ตัวติดตั้งไฟล์นี้สำเร็จแล้วในคิวเดียวกัน"
+                continue
+            }
             if ($Group -in 'Apps','Runtimes','LINE') {
                 $problem = Get-LocalInstallerProblem $file $Group $entry
                 if (-not $problem -and $Group -eq 'Apps' -and $entry.InstallMode) {
@@ -399,6 +422,8 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
             try {
                 if ($Group -eq 'Apps' -and $entry.InstallMode) {
                     Invoke-AppRecipe $entry $steps $timeout $folder
+                    [void]$completedAppFiles.Add($file.FullName)
+                    $programs = @(Get-InstalledProgramRecords)
                     continue
                 }
                 if ($Group -eq 'ACDSee') {
@@ -429,11 +454,13 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
                     Invoke-Program (Join-Path $folder 'setup.exe') ('/configure "{0}"' -f $xml) $timeout $codes -WorkingDirectory $folder
                     continue
                 }
+                $installSucceeded = $true
                 switch ($file.Extension.ToLowerInvariant()) {
                     '.exe' {
                         $skipCodes = @(if ($SkipUnavailable -and $Group -eq 'Apps') { $entry.AutorunSkipExitCodes })
                         $exitCode = Invoke-Program $file.FullName $arguments $timeout (@($codes) + $skipCodes) -WorkingDirectory $folder -PassExitCode -AllowSkip:($Group -eq 'Apps')
                         if ($exitCode -notin $codes) {
+                            $installSucceeded = $false
                             if ($null -ne $UnavailableCount) { $UnavailableCount.Value++ }
                             Write-Log "Autorun: ติดตั้ง $($entry.Name) ไม่สำเร็จ (Exit Code $exitCode) ข้ามไปทำรายการถัดไป"
                         }
@@ -443,6 +470,10 @@ function Invoke-PayloadGroup([string]$Group, [switch]$SkipUnavailable, [switch]$
                     '.ps1' { Invoke-Program "$PSHOME\powershell.exe" ('-NoProfile -NonInteractive -File "{0}" {1}' -f $file.FullName,$arguments) $timeout $codes -WorkingDirectory $folder }
                     '.reg' { Invoke-Program "$env:SystemRoot\System32\reg.exe" ('import "{0}"' -f $file.FullName) $timeout $codes -WorkingDirectory $folder }
                     default { throw "ไม่รองรับชนิดไฟล์ $($file.Extension)" }
+                }
+                if ($Group -eq 'Apps' -and $installSucceeded) {
+                    [void]$completedAppFiles.Add($file.FullName)
+                    $programs = @(Get-InstalledProgramRecords)
                 }
             } catch {
                 if (-not $_.Exception.Data['InstallerSkipped']) { throw }

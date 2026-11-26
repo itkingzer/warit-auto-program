@@ -68,6 +68,7 @@ function Show-AppRecipeEditor($Owner) {
             </Grid>
             <TextBlock Text="ชื่อใน Installed apps (ไม่บังคับ)" Margin="0,10,0,4"/>
             <TextBox Name="DetectName" AutomationProperties.Name="ชื่อใน Installed apps"/>
+            <CheckBox Name="Reinstall" Content="อนุญาตให้ติดตั้งทับเมื่อพบว่าลงแล้ว" Margin="0,8,0,0"/>
           </StackPanel>
         </Border>
         <Border Style="{DynamicResource Card}" CornerRadius="10" Padding="14" Margin="0,0,0,12">
@@ -84,7 +85,8 @@ function Show-AppRecipeEditor($Owner) {
                 <TextBlock Text="วิธีติดตั้ง" Margin="0,0,0,4"/>
                 <ComboBox Name="Mode" SelectedIndex="0" AutomationProperties.Name="วิธีติดตั้ง">
                   <ComboBoxItem Content="Silent"/>
-                  <ComboBoxItem Content="รันผ่าน CMD"/>
+                  <ComboBoxItem Name="CmdMode" Content="รันผ่าน CMD"/>
+                  <ComboBoxItem Content="เปิดตัวติดตั้งให้กดเอง"/>
                 </ComboBox>
               </StackPanel>
               <StackPanel Grid.Column="1">
@@ -97,10 +99,11 @@ function Show-AppRecipeEditor($Owner) {
         </Border>
         <Border Style="{DynamicResource Card}" CornerRadius="10" Padding="14">
           <StackPanel>
-            <DockPanel Margin="0,0,0,8">
-              <Button Name="AddStep" DockPanel.Dock="Right" Content="+ เพิ่มขั้นตอน"/>
-              <TextBlock Text="ลำดับการติดตั้ง" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
-            </DockPanel>
+            <TextBlock Text="ลำดับการติดตั้ง" FontSize="17" FontWeight="SemiBold"/>
+            <WrapPanel Margin="0,8">
+              <Button Name="AddBefore" Content="+ ก่อนตัวติดตั้งหลัก" Margin="0,0,8,0"/>
+              <Button Name="AddStep" Content="+ หลังตัวติดตั้งหลัก"/>
+            </WrapPanel>
             <ListBox Name="StepList" MinHeight="64" MaxHeight="168"
                      Background="{DynamicResource ConsoleBrush}" Foreground="{DynamicResource TextBrush}"
                      BorderBrush="{DynamicResource LineBrush}" DisplayMemberPath="Label"
@@ -110,6 +113,10 @@ function Show-AppRecipeEditor($Owner) {
               <Button Name="MoveDown" Content="เลื่อนลง" Margin="0,0,8,0"/>
               <Button Name="RemoveStep" Content="ลบขั้นตอน"/>
             </WrapPanel>
+            <StackPanel Name="StepOptions" Margin="0,8,0,0" Visibility="Collapsed">
+              <TextBlock Text="พารามิเตอร์ขั้นตอนที่เลือก (Silent EXE ต้องระบุ)" Margin="0,0,0,4"/>
+              <TextBox Name="StepArguments" AutomationProperties.Name="พารามิเตอร์ขั้นตอนที่เลือก"/>
+            </StackPanel>
           </StackPanel>
         </Border>
       </StackPanel>
@@ -122,8 +129,8 @@ function Show-AppRecipeEditor($Owner) {
     $editor.Icon = $Owner.Icon
     $editor.Resources.MergedDictionaries.Add($Owner.Resources)
     $fields = @{}
-    foreach ($id in 'RecipeName','RecipeCategory','DetectName','Mode','Arguments','ModeHint','MainPath',
-        'ChooseMain','AddStep','StepList','MoveUp','MoveDown','RemoveStep','SaveRecipe','Problem') {
+    foreach ($id in 'RecipeName','RecipeCategory','DetectName','Reinstall','Mode','CmdMode','Arguments','ModeHint','MainPath',
+        'ChooseMain','AddBefore','AddStep','StepList','StepOptions','StepArguments','MoveUp','MoveDown','RemoveStep','SaveRecipe','Problem') {
         $fields[$id] = $editor.FindName($id)
     }
     $steps = [Collections.Generic.List[object]]::new()
@@ -136,6 +143,9 @@ function Show-AppRecipeEditor($Owner) {
         $fields.MoveUp.IsEnabled = $index -gt 0
         $fields.MoveDown.IsEnabled = $index -ge 0 -and $index -lt ($steps.Count - 1)
         $fields.RemoveStep.IsEnabled = $index -ge 0 -and -not $steps[$index].Main
+        $editArguments = $index -ge 0 -and -not $steps[$index].Main -and $steps[$index].File.Extension -ne '.reg'
+        $fields.StepOptions.Visibility = if ($editArguments) { 'Visible' } else { 'Collapsed' }
+        if ($editArguments) { $fields.StepArguments.Text = [string]$steps[$index].Arguments }
     }
 
     function Update-RecipeSteps([int]$Index) {
@@ -143,8 +153,9 @@ function Show-AppRecipeEditor($Owner) {
         for ($i = 0; $i -lt $steps.Count; $i++) {
             $step = $steps[$i]
             $kind = if ($step.Main) {
-                if ($fields.Mode.SelectedIndex -eq 0) { 'Silent · ไฟล์หลัก' } else { 'CMD · ไฟล์หลัก' }
-            } elseif ($step.File.Extension -eq '.reg') { 'นำเข้า Registry' } else { 'รันผ่าน CMD' }
+                @('Silent · ไฟล์หลัก','CMD · ไฟล์หลัก','กดติดตั้งเอง · ไฟล์หลัก')[$fields.Mode.SelectedIndex]
+            } elseif ($step.File.Extension -eq '.reg') { 'นำเข้า Registry' }
+            elseif ($step.File.Extension -in '.exe','.msi') { 'Silent' } else { 'รันผ่าน CMD' }
             $filename = if ($step.File) { $step.File.Name } else { 'ยังไม่ได้เลือกไฟล์' }
             [void]$fields.StepList.Items.Add([pscustomobject]@{ Label = "$($i + 1). $kind   $filename" })
         }
@@ -165,12 +176,19 @@ function Show-AppRecipeEditor($Owner) {
 
     function Update-RecipeMode {
         $fields.ModeHint.Text = if ($fields.Mode.SelectedIndex -eq 1) { 'ใส่พารามิเตอร์ที่ไฟล์หลักต้องใช้เมื่อรันผ่าน CMD' }
+            elseif ($fields.Mode.SelectedIndex -eq 2) { 'เปิดหน้าต่างตัวติดตั้งให้ทำตามขั้นตอน' }
             elseif ($main.File.Extension -eq '.msi') { 'MSI จะใช้ /qn /norestart อัตโนมัติ' }
             else { 'สำหรับ EXE ให้ใช้พารามิเตอร์ Silent ตามคู่มือของตัวติดตั้ง' }
         Update-RecipeSteps $fields.StepList.SelectedIndex
     }
 
     $fields.StepList.Add_SelectionChanged({ Update-RecipeButtons })
+    $fields.StepArguments.Add_TextChanged({
+        $index = $fields.StepList.SelectedIndex
+        if ($fields.StepOptions.Visibility -eq 'Visible' -and $index -ge 0 -and -not $steps[$index].Main) {
+            $steps[$index].Arguments = $fields.StepArguments.Text
+        }
+    })
     $fields.Mode.Add_SelectionChanged({ Update-RecipeMode })
     $fields.ChooseMain.Add_Click({
         try {
@@ -184,21 +202,24 @@ function Show-AppRecipeEditor($Owner) {
             $fields.MainPath.Text = $file.FullName
             $fields.Arguments.Clear()
             $fields.Mode.SelectedIndex = [int]($file.Extension -in '.cmd','.bat')
-            $fields.Mode.IsEnabled = $file.Extension -eq '.exe'
+            $fields.CmdMode.IsEnabled = $file.Extension -ne '.msi'
+            $fields.Mode.IsEnabled = $file.Extension -in '.exe','.msi'
             $fields.Problem.Text = ''
             Update-RecipeMode
         } catch { $fields.Problem.Text = $_.Exception.Message }
     })
-    $fields.AddStep.Add_Click({
+    function Add-RecipeStep([int]$Index) {
         try {
-            $file = Select-RecipeFile 'ขั้นตอนเพิ่มเติม (*.reg;*.cmd;*.bat)|*.reg;*.cmd;*.bat'
+            $file = Select-RecipeFile 'ขั้นตอนเพิ่มเติม (*.exe;*.msi;*.reg;*.cmd;*.bat)|*.exe;*.msi;*.reg;*.cmd;*.bat'
             if (-not $file) { return }
-            if ($file.Extension -notin '.reg','.cmd','.bat') { throw 'เลือกไฟล์ REG, CMD หรือ BAT' }
-            $steps.Add(@{ Main = $false; File = $file })
+            if ($file.Extension -notin '.exe','.msi','.reg','.cmd','.bat') { throw 'เลือกไฟล์ EXE, MSI, REG, CMD หรือ BAT' }
+            $steps.Insert($Index, @{ Main = $false; File = $file; Arguments = '' })
             $fields.Problem.Text = ''
-            Update-RecipeSteps ($steps.Count - 1)
+            Update-RecipeSteps $Index
         } catch { $fields.Problem.Text = $_.Exception.Message }
-    })
+    }
+    $fields.AddBefore.Add_Click({ Add-RecipeStep ($steps.IndexOf($main)) })
+    $fields.AddStep.Add_Click({ Add-RecipeStep $steps.Count })
     $fields.MoveUp.Add_Click({
         $index = $fields.StepList.SelectedIndex
         $step = $steps[$index]
@@ -223,7 +244,7 @@ function Show-AppRecipeEditor($Owner) {
             if (-not $main.File) { throw 'เลือกไฟล์หลักก่อนบันทึก' }
             $name = $fields.RecipeName.Text.Trim()
             if (-not $name) { throw 'ระบุชื่อโปรแกรม' }
-            $mode = if ($fields.Mode.SelectedIndex -eq 0) { 'Silent' } else { 'Cmd' }
+            $mode = @('Silent','Cmd','Interactive')[$fields.Mode.SelectedIndex]
             $arguments = $fields.Arguments.Text.Trim()
             if ($mode -eq 'Silent' -and $main.File.Extension -eq '.exe' -and -not $arguments) {
                 [void]$fields.Arguments.Focus()
@@ -232,17 +253,18 @@ function Show-AppRecipeEditor($Owner) {
             $sources = @{}
             foreach ($step in $steps) {
                 $file = $step.File
-                if ($sources.ContainsKey($file.Name) -and $sources[$file.Name] -ne $file.FullName) {
-                    throw "ไฟล์ชื่อซ้ำจากคนละโฟลเดอร์: $($file.Name)"
+                if ($sources.ContainsKey($file.Name)) { throw "ไฟล์ซ้ำในลำดับติดตั้ง: $($file.Name)" }
+                if (-not $step.Main -and $file.Extension -eq '.exe' -and [string]::IsNullOrWhiteSpace($step.Arguments)) {
+                    throw "ระบุพารามิเตอร์ Silent ของไฟล์ $($file.Name)"
                 }
                 $sources[$file.Name] = $file.FullName
             }
             $result.Draft = [pscustomobject]@{
                 Name = $name; File = $main.File; Category = $fields.RecipeCategory.SelectedIndex
                 DetectName = $fields.DetectName.Text.Trim(); Mode = $mode; Arguments = $arguments
-                Sources = $sources
+                Sources = $sources; Reinstall = [bool]$fields.Reinstall.IsChecked
                 Steps = @(foreach ($step in $steps) {
-                    [pscustomobject]@{ File = $step.File.Name; Main = $step.Main }
+                    [pscustomobject]@{ File = $step.File.Name; Main = $step.Main; Arguments = ([string]$step.Arguments).Trim() }
                 })
             }
             $editor.DialogResult = $true
@@ -511,11 +533,14 @@ function Show-AppSelection($Owner, [string]$AppsPath, [string]$ConfigPath, $Conf
             $imports = [Collections.Generic.List[object]]::new()
             $updated = $Config | ConvertTo-Json -Depth 100 | ConvertFrom-Json
             $pending = @($rows | Where-Object { $_.Draft -or ($_.Candidate -and $_.Check.IsChecked) })
+            $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($configured in $existing) { [void]$names.Add([string]$configured.Name) }
             $available = @(Find-NewAppInstallers $AppsPath $existing | ForEach-Object { $_.File.FullName })
             $newEntries = @(foreach ($row in $pending) {
                 $file = $row.Candidate.File
                 if ($row.Draft) {
                     $draft = $row.Draft
+                    if (-not $names.Add($draft.Name)) { throw "มีโปรแกรมชื่อ $($draft.Name) ในรายการแล้ว" }
                     $subfolder = [guid]::NewGuid().ToString('N')
                     $folder = Join-Path $AppsPath $subfolder
                     foreach ($source in $draft.Sources.GetEnumerator()) {
@@ -527,6 +552,7 @@ function Show-AppSelection($Owner, [string]$AppsPath, [string]$ConfigPath, $Conf
                         Steps = $draft.Steps; Enabled = [bool]$row.Check.IsChecked
                     }
                     if ($draft.Category -eq 1) { $entry.Category = 'Crack' }
+                    if ($draft.Reinstall) { $entry.Reinstall = $true }
                     if ($draft.DetectName) { $entry.DetectName = '^' + [regex]::Escape($draft.DetectName) + '$' }
                     [pscustomobject]$entry
                     continue
@@ -548,6 +574,7 @@ function Show-AppSelection($Owner, [string]$AppsPath, [string]$ConfigPath, $Conf
                     Arguments = $arguments
                     Enabled = $true
                 }
+                if (-not $names.Add($newEntry.Name)) { throw "มีโปรแกรมชื่อ $($newEntry.Name) ในรายการแล้ว" }
                 if ($name) { $newEntry.DetectName = '^' + [regex]::Escape($name) + '$' }
                 if ($row.CategoryPicker.SelectedIndex -eq 1) { $newEntry.Category = 'Crack' }
                 if ($row.Candidate.Subfolder) { $newEntry.Subfolder = $row.Candidate.Subfolder }
