@@ -852,8 +852,9 @@ $worker = {
     function Assert-Running {
         if ($Cancel.IsCancellationRequested) { throw [OperationCanceledException]::new('ยกเลิกตามคำสั่งผู้ใช้') }
     }
-    function Invoke-Program([string]$File, [string]$Arguments, [int]$Timeout, [int[]]$SuccessCodes, [string]$WorkingDirectory = $Root, [switch]$IgnoreCancellation, [switch]$CaptureOutput, [switch]$SuppressOutput, [switch]$PassExitCode, [switch]$AllowSkip) {
+    function Invoke-Program([string]$File, [string]$Arguments, [int]$Timeout, [int[]]$SuccessCodes, [string]$WorkingDirectory = $Root, [switch]$IgnoreCancellation, [switch]$CaptureOutput, [switch]$SuppressOutput, [switch]$PassExitCode, [switch]$AllowSkip, [switch]$LiveOutput, [switch]$PressEnterWhenIdle) {
         if (-not $IgnoreCancellation) { Assert-Running }
+        if ($PressEnterWhenIdle) { $LiveOutput = $true }
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $File
         $info.Arguments = $Arguments
@@ -862,6 +863,7 @@ $worker = {
         $info.CreateNoWindow = $true
         $info.RedirectStandardOutput = $true
         $info.RedirectStandardError = $true
+        $info.RedirectStandardInput = [bool]$LiveOutput
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $info
         $skip = $null
@@ -875,7 +877,17 @@ $worker = {
                 $skip = [hashtable]::Synchronized(@{ Requested = $false })
                 Publish InstallerSkip $skip
             }
-            if ($SuppressOutput) {
+            if ($LiveOutput) {
+                if (-not $PressEnterWhenIdle) { $process.StandardInput.Close() }
+                $streams = @{
+                    stdout = $process.StandardOutput
+                    stderr = $process.StandardError
+                }
+                $pending = @{}
+                foreach ($streamName in $streams.Keys) {
+                    $pending[$streamName] = $streams[$streamName].ReadLineAsync()
+                }
+            } elseif ($SuppressOutput) {
                 $stdout = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
                 $stderr = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
             } else {
@@ -884,7 +896,34 @@ $worker = {
             }
             $timer = [Diagnostics.Stopwatch]::StartNew()
             $nextWaitLog = 10
-            while (-not $process.WaitForExit(250)) {
+            $nextEnter = 15
+            $enterAttempts = 0
+            $exitWait = $null
+            while ($true) {
+                $exited = $process.WaitForExit(250)
+                if ($LiveOutput) {
+                    foreach ($streamName in $streams.Keys) {
+                        for ($lineCount = 0; $lineCount -lt 100 -and $pending[$streamName].IsCompleted; $lineCount++) {
+                            $line = $pending[$streamName].GetAwaiter().GetResult()
+                            if ($null -eq $line) {
+                                $pending.Remove($streamName)
+                                break
+                            }
+                            if ($line.Trim()) {
+                                Write-Log "[$name $streamName] $($line.TrimEnd())"
+                                $nextEnter = $timer.Elapsed.TotalSeconds + 15
+                            }
+                            $pending[$streamName] = $streams[$streamName].ReadLineAsync()
+                        }
+                    }
+                }
+                if ($exited) {
+                    if (-not $LiveOutput -or -not $pending.Count) { break }
+                    if ($null -eq $exitWait) { $exitWait = [Diagnostics.Stopwatch]::StartNew() }
+                    if ($exitWait.ElapsedMilliseconds -ge 1000) { break }
+                    Start-Sleep -Milliseconds 10
+                    continue
+                }
                 if ($skip.Requested -or $timer.Elapsed.TotalSeconds -ge $Timeout) {
                     $skipped = $skip.Requested
                     $reason = if ($skipped) { 'ข้ามตามคำสั่งผู้ใช้' } else { 'หมดเวลารอ' }
@@ -902,13 +941,24 @@ $worker = {
                     }
                     throw "หมดเวลารอ $File ($Timeout วินาที)"
                 }
+                if ($PressEnterWhenIdle -and $enterAttempts -lt 3 -and $timer.Elapsed.TotalSeconds -ge $nextEnter) {
+                    try {
+                        $process.StandardInput.WriteLine()
+                        $enterAttempts++
+                        Write-Log "$name ไม่มีข้อความใหม่ | ส่ง Enter ครั้งที่ $enterAttempts"
+                    } catch [IO.IOException] {
+                        $PressEnterWhenIdle = $false
+                        Write-Log "$name ปิดช่องรับคำสั่งแล้ว | หยุดส่ง Enter"
+                    }
+                    $nextEnter = $timer.Elapsed.TotalSeconds + 5
+                }
                 if (-not $SuppressOutput -and $timer.Elapsed.TotalSeconds -ge $nextWaitLog) {
                     $remaining = [Math]::Max(0, $Timeout - [int]$timer.Elapsed.TotalSeconds)
                     Write-Log "โปรเซส $name (PID $($process.Id)) ยังทำงาน | รอแล้ว $nextWaitLog วินาที | เหลือก่อนหมดเวลา $remaining วินาที"
                     $nextWaitLog += 10
                 }
             }
-            if (-not $CaptureOutput -and -not $SuppressOutput) {
+            if (-not $LiveOutput -and -not $CaptureOutput -and -not $SuppressOutput) {
                 foreach ($streamName in 'stdout','stderr') {
                     $stream = if ($streamName -eq 'stdout') { $stdout } else { $stderr }
                     if ($stream.Wait(1000) -and $stream.Result.Trim()) { Write-Log "[$name $streamName] $($stream.Result.TrimEnd())" }

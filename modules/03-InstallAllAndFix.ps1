@@ -487,12 +487,13 @@ function Invoke-PrinterFix {
     $phase = 'GPEDIT'
     try {
         Write-Log 'Printer: เริ่ม 1.gpedit.bat'
-        Invoke-Program "$env:SystemRoot\System32\cmd.exe" '/d /c .\1.gpedit.bat' $timeout @(0,3010) -WorkingDirectory $fixFolder
+        Invoke-Program "$env:SystemRoot\System32\cmd.exe" '/d /c .\1.gpedit.bat' $timeout @(0,3010) -WorkingDirectory $fixFolder -PressEnterWhenIdle
         $phase = 'RPC'
         Write-Log 'Printer: นำเข้า 2.RPC.reg'
         Invoke-Program "$env:SystemRoot\System32\reg.exe" ('import "{0}"' -f $registry) $timeout @(0) -WorkingDirectory $fixFolder
         $phase = 'SMB client signing'
         Assert-Running
+        Write-Log 'Printer: เริ่มตั้งค่า SMB client signing'
         Set-SmbClientConfiguration -RequireSecuritySignature $false -Confirm:$false -ErrorAction Stop | Out-Null
         Write-Log 'Printer: ยกเลิกการบังคับ SMB client signing แล้ว'
     } catch [OperationCanceledException] {
