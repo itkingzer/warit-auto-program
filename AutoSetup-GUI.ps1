@@ -805,7 +805,7 @@ function Update-PayloadTaskVisibility {
 }
 $ui = @{
     Work = $null; Space = $null; Handle = $null; Token = $null; Mode = ''; Resume = $resume
-    UpdateRows = [ordered]@{}; UpdateManualTitles = @()
+    UpdateRows = [ordered]@{}; UpdateManualTitles = @(); UpdatePreviewTitles = @()
 }
 foreach ($box in $checks.Values) {
     $box.Add_Checked({ Update-SelectionSummary })
@@ -960,9 +960,10 @@ $worker = {
         . (Join-Path $Root 'modules\04-WindowsUpdateLoop.ps1')
         try {
             $manualTitles = @()
-            $list = @(Get-SetupUpdateList ([ref]$manualTitles))
+            $previewTitles = @()
+            $list = @(Get-SetupUpdateList ([ref]$manualTitles) ([ref]$previewTitles))
             $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-            Publish UpdateList @{ Items = $list; ManualTitles = $manualTitles; RebootRequired = $systemInfo.RebootRequired }
+            Publish UpdateList @{ Items = $list; ManualTitles = $manualTitles; PreviewTitles = $previewTitles; RebootRequired = $systemInfo.RebootRequired }
         } catch [OperationCanceledException] {
             Publish UpdateScanError 'ยกเลิกการตรวจอัปเดตแล้ว'
         } catch {
@@ -1134,6 +1135,7 @@ function Show-UpdateRows {
     $controls.AvailableUpdates.Text = (@(
         foreach ($row in $ui.UpdateRows.Values) { "• $($row.Title) — $($row.Status)" }
         foreach ($title in $ui.UpdateManualTitles) { "• $title — ต้องดำเนินการเอง" }
+        foreach ($title in $ui.UpdatePreviewTitles) { "• $title — อัปเดตเสริม แนะนำให้ข้าม (แอปข้ามให้อัตโนมัติ)" }
     )) -join "`n"
 }
 function Show-UpdateTiming {
@@ -1249,9 +1251,11 @@ $poll.Add_Tick({
                         $ui.UpdateRows[$item.Key] = @{ Title = $item.Title; Status = 'รอยืนยันติดตั้ง' }
                     }
                     $ui.UpdateManualTitles = $scan.ManualTitles
+                    $ui.UpdatePreviewTitles = $scan.PreviewTitles
                     Show-UpdateRows
                     $summary = if ($ui.UpdateList.Count) { "พบ $($ui.UpdateList.Count) รายการ รอยืนยันติดตั้ง" } else { 'ไม่พบอัปเดตที่ติดตั้งอัตโนมัติได้' }
                     if ($scan.ManualTitles.Count) { $summary += " · ต้องดำเนินการเอง $($scan.ManualTitles.Count) รายการ" }
+                    if ($scan.PreviewTitles.Count) { $summary += " · ข้าม Preview $($scan.PreviewTitles.Count) รายการ" }
                     if ($scan.RebootRequired) { $summary += ' · Windows รอรีสตาร์ท' }
                     Set-UpdateSummary $summary
                     $controls.Status.Text = $controls.UpdateSummary.Text
@@ -1286,9 +1290,11 @@ $poll.Add_Tick({
                 }
                 UpdateComplete {
                     $ui.UpdateManualTitles = $eventItem.Value.ManualTitles
+                    $ui.UpdatePreviewTitles = $eventItem.Value.PreviewTitles
                     $summary = if ($ui.UpdateManualTitles.Count) {
                         "ติดตั้งอัตโนมัติเสร็จ เหลือ $($ui.UpdateManualTitles.Count) รายการที่ต้องดำเนินการเอง"
                     } else { 'ตรวจซ้ำแล้ว ไม่พบอัปเดตที่เหลือ' }
+                    if ($ui.UpdatePreviewTitles.Count) { $summary += " · ข้าม Preview $($ui.UpdatePreviewTitles.Count) รายการ" }
                     Set-UpdateSummary $summary
                     Show-UpdateRows
                 }
@@ -1438,6 +1444,7 @@ $controls.ScanUpdates.Add_Click({
     $ui.UpdateList = @()
     $ui.UpdateRows.Clear()
     $ui.UpdateManualTitles = @()
+    $ui.UpdatePreviewTitles = @()
     Show-UpdateRows
     Set-UpdateSummary 'กำลังตรวจ Windows Update…' -Waiting
     $controls.Status.Text = $controls.UpdateSummary.Text

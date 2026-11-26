@@ -181,11 +181,20 @@ function Search-SetupUpdates($Session, [switch]$Online) {
     } finally { Close-UpdateJob $job }
 }
 
-function Get-SetupUpdateList([ref]$ManualTitles) {
+function Test-PreviewUpdateTitle([string]$Title) {
+    return $Title -match '\bPreview\b|ตัวอย่าง'
+}
+
+function Get-SetupUpdateList([ref]$ManualTitles, [ref]$PreviewTitles) {
     $session = New-Object -ComObject Microsoft.Update.Session
     $search = Search-SetupUpdates $session -Online
     foreach ($update in $search.Updates) {
         Assert-Running
+        if (Test-PreviewUpdateTitle $update.Title) {
+            Write-Log "ข้ามอัปเดต Preview: $($update.Title)"
+            if ($null -ne $PreviewTitles) { $PreviewTitles.Value += [string]$update.Title }
+            continue
+        }
         if ($update.InstallationBehavior.CanRequestUserInput) {
             Write-Log "ข้ามรายการที่ต้องตอบโต้: $($update.Title)"
             if ($null -ne $ManualTitles) { $ManualTitles.Value += [string]$update.Title }
@@ -227,6 +236,13 @@ function Invoke-WindowsUpdateBatch([object[]]$UpdateList, [hashtable]$Processed)
         $itemStatus = "รายการ $($i + 1)/$($UpdateList.Count) — $($item.Title)"
         Write-Log "Windows Update | $itemStatus"
         Publish-UpdateItem $item 'กำลังเตรียมรายการ' -Active
+        if ((Test-PreviewUpdateTitle $item.Title) -or ($update -and (Test-PreviewUpdateTitle $update.Title))) {
+            $skipped++
+            $Processed[$item.Key] = $true
+            Write-Log "ข้ามอัปเดต Preview: $($item.Title)"
+            Publish-UpdateItem $item 'ข้าม Preview'
+            continue
+        }
         if (-not $update -or $update.IsInstalled -or $update.InstallationBehavior.CanRequestUserInput) {
             $skipped++
             $Processed[$item.Key] = $true
@@ -312,7 +328,8 @@ function Invoke-WindowsUpdateLoop([object[]]$UpdateList, [string[]]$ProcessedUpd
         $checking = 'กำลังตรวจ Windows Update อีกครั้งเพื่อหาอัปเดตที่เหลือ'
         Write-Log $checking
         $manualTitles = @()
-        $offered = @(Get-SetupUpdateList ([ref]$manualTitles))
+        $previewTitles = @()
+        $offered = @(Get-SetupUpdateList ([ref]$manualTitles) ([ref]$previewTitles))
         $UpdateList = @($offered | Where-Object {
             if ($processed.ContainsKey($_.Key)) { Write-Log "Windows ยังเสนอรายการเดิม: $($_.Title) | ข้ามการลองซ้ำ" }
             else { $true }
@@ -325,7 +342,7 @@ function Invoke-WindowsUpdateLoop([object[]]$UpdateList, [string[]]$ProcessedUpd
             if ($failures.Count) { throw "Windows Update ประมวลผลรายการอื่นต่อแล้ว แต่มี $($failures.Count) รายการที่ไม่สำเร็จ ดูรายละเอียดใน Log" }
             if ($offered.Count) { throw 'Windows Update ยังเสนอเฉพาะรายการเดิม หยุดวนซ้ำ ดูชื่อรายการใน Log' }
             Write-Log 'ตรวจซ้ำแล้วไม่พบอัปเดตที่ติดตั้งอัตโนมัติได้ ปิดการเปิดต่อหลังรีสตาร์ทแล้ว'
-            return [pscustomobject]@{ ManualTitles = $manualTitles }
+            return [pscustomobject]@{ ManualTitles = $manualTitles; PreviewTitles = $previewTitles }
         }
     }
 }
