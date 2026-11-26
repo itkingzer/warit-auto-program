@@ -461,10 +461,10 @@ function Invoke-PrinterFix {
         $folderName = $PayloadFolders.Printer
         $source = Join-Path $Root ('payloads\' + $folderName)
         if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "ไม่พบโฟลเดอร์ Printer: $source" }
-        $fixFolder = Join-Path $source 'Code error 709'
-        $batch = Join-Path $fixFolder '1.gpedit.bat'
-        $registry = Join-Path $fixFolder '2.RPC.reg'
-        foreach ($path in $batch, $registry) {
+        $fixSubfolder = 'Code error 709'
+        $sourceFixFolder = Join-Path $source $fixSubfolder
+        foreach ($name in '1.gpedit.bat','2.RPC.reg') {
+            $path = Join-Path $sourceFixFolder $name
             $file = Get-Item -LiteralPath $path -ErrorAction Stop
             if ($file.PSIsContainer -or -not $file.Length -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                 throw "ไฟล์ Printer ไม่พร้อมใช้งาน: $path"
@@ -473,7 +473,10 @@ function Invoke-PrinterFix {
         $destinationRoot = Join-Path $env:ProgramData 'WaritAutoSetup'
         New-Item -ItemType Directory -Path $destinationRoot -Force -ErrorAction Stop | Out-Null
         Copy-Item -LiteralPath $source -Destination $destinationRoot -Recurse -Force -ErrorAction Stop
-        Write-Log "Printer: คัดลอกไฟล์ไปที่ $(Join-Path $destinationRoot $folderName) แล้ว"
+        $destination = Join-Path $destinationRoot $folderName
+        $fixFolder = Join-Path $destination $fixSubfolder
+        $registry = Join-Path $fixFolder '2.RPC.reg'
+        Write-Log "Printer: คัดลอกไฟล์ไปที่ $destination แล้ว"
     } catch {
         Write-Log "Printer: คัดลอกไฟล์ไม่สำเร็จ: $($_.Exception.Message)"
         Write-Log 'Printer: ไม่เปลี่ยนการตั้งค่า SMB client signing เนื่องจากคัดลอกไฟล์ไม่สำเร็จ'
@@ -484,7 +487,7 @@ function Invoke-PrinterFix {
     $phase = 'GPEDIT'
     try {
         Write-Log 'Printer: เริ่ม 1.gpedit.bat'
-        Invoke-Program "$env:SystemRoot\System32\cmd.exe" ('/d /s /c ""{0}""' -f $batch) $timeout @(0,3010) -WorkingDirectory $fixFolder
+        Invoke-Program "$env:SystemRoot\System32\cmd.exe" '/d /c .\1.gpedit.bat' $timeout @(0,3010) -WorkingDirectory $fixFolder
         $phase = 'RPC'
         Write-Log 'Printer: นำเข้า 2.RPC.reg'
         Invoke-Program "$env:SystemRoot\System32\reg.exe" ('import "{0}"' -f $registry) $timeout @(0) -WorkingDirectory $fixFolder
